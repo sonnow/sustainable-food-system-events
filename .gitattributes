@@ -1,0 +1,14 @@
+# Enforce Unix line endings for all text files
+# Prevents CRLF issues when files are edited on Windows and run on Linux (GitHub Actions)
+
+* text=auto eol=lf
+
+# Explicitly mark binary files so Git never touches their line endings
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.gz binary
