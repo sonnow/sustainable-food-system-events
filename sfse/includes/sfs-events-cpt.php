@@ -260,6 +260,64 @@ add_action( 'sfse_daily_cleanup', 'sfse_cleanup_rejected_events' );
 
 
 /**
+ * Daily cron: unpublish events whose end date (or start date) has passed.
+ *
+ * Events are set to draft rather than deleted so an admin can review them.
+ * A grace period of SFSE_PAST_EVENT_GRACE_DAYS days is applied so that an
+ * event ending today is not immediately hidden from visitors.
+ *
+ * The grace period constant can be overridden in wp-config.php:
+ *   define( 'SFSE_PAST_EVENT_GRACE_DAYS', 3 );
+ */
+function sfse_unpublish_past_events() {
+
+    $grace_days = defined( 'SFSE_PAST_EVENT_GRACE_DAYS' )
+        ? intval( SFSE_PAST_EVENT_GRACE_DAYS )
+        : 1;
+
+    // Cutoff: anything that ended more than $grace_days ago is past
+    $cutoff = date( 'Y-m-d H:i:s', strtotime( "-{$grace_days} days" ) );
+
+    // Fetch all published events
+    $posts = get_posts( array(
+        'post_type'      => 'sfse_event',
+        'post_status'    => 'publish',
+        'numberposts'    => -1,
+        'fields'         => 'ids',   // lightweight — we only need IDs
+    ));
+
+    if ( empty( $posts ) ) {
+        return;
+    }
+
+    foreach ( $posts as $post_id ) {
+
+        // Prefer date_end; fall back to date_start if end is not set
+        $end   = get_post_meta( $post_id, 'sfse_date_end',   true );
+        $start = get_post_meta( $post_id, 'sfse_date_start', true );
+        $date  = $end ?: $start;
+
+        if ( ! $date ) {
+            continue; // no date data — leave alone
+        }
+
+        // Normalise: ensure we have a full datetime string
+        if ( strlen( $date ) === 10 ) {
+            $date .= ' 23:59:00'; // date-only → treat as end of day
+        }
+
+        if ( $date < $cutoff ) {
+            wp_update_post( array(
+                'ID'          => $post_id,
+                'post_status' => 'draft',
+            ));
+        }
+    }
+}
+add_action( 'sfse_daily_cleanup', 'sfse_unpublish_past_events' );
+
+
+/**
  * Auto-draft a post immediately when a rejection reason is saved.
  * Works whether set by the agent via REST API or manually in WP admin.
  */
