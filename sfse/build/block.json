@@ -1,0 +1,18 @@
+{
+    "$schema": "https://schemas.wp.org/trunk/block.json",
+    "apiVersion": 3,
+    "name": "sfse/events",
+    "version": "1.0.0",
+    "title": "SFS Events",
+    "category": "widgets",
+    "icon": "calendar-alt",
+    "description": "Displays the Sustainable Food System Events grid with filters.",
+    "keywords": ["events", "sustainable", "food", "filter"],
+    "textdomain": "sfse",
+    "editorScript": "file:./index.js",
+    "editorStyle":  "file:./index.css",
+    "supports": {
+        "html": false,
+        "align": ["wide", "full"]
+    }
+}

@@ -1,0 +1,13 @@
+{
+    "name": "sustainable-food-system-events",
+    "version": "1.0.0",
+    "description": "Build tooling for the SFSE Gutenberg block",
+    "scripts": {
+        "build":   "wp-scripts build block/index.js --output-path=build",
+        "start":   "wp-scripts start block/index.js --output-path=build",
+        "lint:js": "wp-scripts lint-js block/index.js"
+    },
+    "devDependencies": {
+        "@wordpress/scripts": "^30.0.0"
+    }
+}

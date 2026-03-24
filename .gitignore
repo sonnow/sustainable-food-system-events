@@ -1,0 +1,29 @@
+# Environment — never commit credentials
+SFSEventAgent-1.0/.env
+
+# Agent runtime files — state is stored in WordPress, not needed in version control
+SFSEventAgent-1.0/agent.log
+SFSEventAgent-1.0/seen_events.json
+SFSEventAgent-1.0/source_scores.json
+
+# Node
+sfse/node_modules/
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

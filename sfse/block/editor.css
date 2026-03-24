@@ -1,0 +1,186 @@
+/*
+ * SFSE Events Block — Editor styles
+ * Skeleton UI placeholder shown in Site Editor / block editor
+ */
+
+.sfse-editor-preview {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 1.5rem;
+    background: #f9f9f9;
+    border-radius: 8px;
+    border: 1px dashed #c0c8c0;
+    user-select: none;
+    pointer-events: none;
+}
+
+/* ── Label ───────────────────────────────────────────────────────────────────── */
+.sfse-editor-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #426833;
+    margin-bottom: 1.25rem;
+}
+
+.sfse-editor-icon {
+    font-size: 1rem;
+}
+
+/* ── Skeleton base ───────────────────────────────────────────────────────────── */
+.sfse-skeleton {
+    background: #e8ede8;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+
+/* ── Filter skeleton ─────────────────────────────────────────────────────────── */
+.sfse-skeleton-filters {
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid #e0e6e0;
+}
+
+.sfse-skeleton-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+}
+
+.sfse-skeleton-select {
+    height: 38px;
+    width: 220px;
+    border-radius: 6px;
+}
+
+.sfse-skeleton-date-group {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    flex: 1;
+}
+
+.sfse-skeleton-preset {
+    height: 28px;
+    width: 100px;
+    border-radius: 20px;
+}
+
+.sfse-skeleton-btn {
+    height: 38px;
+    width: 70px;
+    border-radius: 6px;
+}
+
+.sfse-skeleton-advanced {
+    height: 20px;
+    width: 120px;
+    border-radius: 4px;
+}
+
+/* ── Card grid skeleton ──────────────────────────────────────────────────────── */
+.sfse-skeleton-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.5rem;
+}
+
+.sfse-skeleton-card {
+    background: #f0f4f0;
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.sfse-skeleton-card-header {
+    background: #e4ebe4;
+    padding: 0.875rem 1rem 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.sfse-skeleton-date-line {
+    height: 10px;
+    width: 80px;
+}
+
+.sfse-skeleton-title {
+    height: 14px;
+    width: 90%;
+}
+
+.sfse-skeleton-title-short {
+    width: 65%;
+}
+
+.sfse-skeleton-card-body {
+    padding: 0.875rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    flex: 1;
+}
+
+.sfse-skeleton-organiser {
+    height: 10px;
+    width: 45%;
+}
+
+.sfse-skeleton-text {
+    height: 10px;
+    width: 100%;
+}
+
+.sfse-skeleton-text-short {
+    width: 70%;
+}
+
+.sfse-skeleton-tags {
+    display: flex;
+    gap: 0.4rem;
+    margin-top: 0.25rem;
+    flex-wrap: wrap;
+}
+
+.sfse-skeleton-tag {
+    height: 22px;
+    width: 80px;
+    border-radius: 4px;
+}
+
+.sfse-skeleton-tag-wide {
+    width: 120px;
+}
+
+.sfse-skeleton-badges {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+
+.sfse-skeleton-badge {
+    height: 24px;
+    width: 70px;
+    border-radius: 20px;
+}
+
+.sfse-skeleton-badge-wide {
+    width: 110px;
+}
+
+.sfse-skeleton-card-footer {
+    padding: 0.75rem 1rem;
+    display: flex;
+    justify-content: space-between;
+}
+
+.sfse-skeleton-link {
+    height: 12px;
+    width: 80px;
+}

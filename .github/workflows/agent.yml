@@ -1,0 +1,49 @@
+name: SFS Events Agent
+
+on:
+  # Weekly schedule — Sunday 5am UTC (6am CET / 7am CEST)
+  # Actual run frequency is controlled by sfse_agent_run_interval_days in WP settings.
+  # This cron is the outer envelope; the agent's own freshness check handles skipping
+  # sources that were checked recently enough.
+  schedule:
+    - cron: '0 5 * * 0'
+
+  # Manual trigger — run on demand from the GitHub Actions UI
+  # Useful for testing or forcing a run outside the schedule.
+  workflow_dispatch:
+
+jobs:
+  run-agent:
+    name: Run SFS Events Agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 60   # agent can take 30-45 min on a full run
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r SFSEventAgent-1.0/requirements.txt
+
+      - name: Run agent
+        working-directory: SFSEventAgent-1.0
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          WP_BASE_URL:       ${{ secrets.WP_BASE_URL }}
+          WP_USERNAME:       ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD:   ${{ secrets.WP_APP_PASSWORD }}
+        run: python agent.py
+
+      - name: Upload agent log
+        if: always()   # upload log even if the agent run failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-log-${{ github.run_number }}
+          path: SFSEventAgent-1.0/agent.log
+          retention-days: 30
