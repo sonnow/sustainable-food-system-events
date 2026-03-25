@@ -23,7 +23,7 @@ import re
 import time
 import logging
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dotenv import load_dotenv
 import anthropic
@@ -66,29 +66,42 @@ SEARCH_TO       = (TODAY + timedelta(days=365)).strftime("%Y-%m-%d")
 # Agent limits
 MAX_CANDIDATES              = 50    # stop searching once this many raw events are found
 MAX_TOKENS_PER_CALL         = 4000  # cap output tokens per API call — 3000 caused truncation with longer descriptions
-MAX_EVENTS_PER_CALL         = 10    # cap events per response to avoid truncation
+MAX_EVENTS_PER_CALL         = 1     # one event per call — eliminates cross-contamination between events
 SOURCE_MIN_RUNS             = 3     # minimum runs before a source can be deprioritised
 SOURCE_LOW_QUALITY_RATE     = 0.75  # deprioritise if rejection rate exceeds this
 SOURCE_FRESHNESS_DAYS       = 14    # skip sources checked successfully within this many days
 API_CALL_DELAY              = 65    # seconds between API calls (token budget reset)
-API_CALL_DELAY_LARGE        = 90    # longer pause after responses with 3+ events
+API_CALL_DELAY_LARGE        = 180   # after large responses — observed 120s caused consistent 429s
+API_CALL_DELAY_AFTER_429    = 180   # after a rate-limit failure — same budget reset time as large responses
+
+# Deep search (pass 2) limits
+DEEP_SEARCH_MAX_QUERIES     = 8     # hard cap on pass 2 API calls per run — tune up after first production run
 
 # Image fetch settings
-IMAGE_FETCH_TIMEOUT = 8             # seconds — don't hang on slow event sites
-IMAGE_FETCH_UA      = (             # identify ourselves politely to event sites
-    "SustainableFoodSystemEvents-Bot/1.2 "
+IMAGE_FETCH_TIMEOUT  = 8            # seconds — don't hang on slow event sites
+IMAGE_FETCH_UA       = (            # identify ourselves politely to event sites
+    "SustainableFoodSystemEvents-Bot/1.3 "
     "(+https://github.com/sonnow/sustainable-food-system-events)"
 )
-IMAGE_HEAD_MAX_BYTES = 51200        # 50 KB — enough to always capture <head>
+IMAGE_HEAD_MAX_BYTES = 102400       # 100 KB — enough for <head> + opening body (hero images)
+
+# URL tracking parameters to strip during canonicalisation
+URL_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_reader", "ref", "fbclid", "gclid", "mc_cid", "mc_eid",
+    "hsCtaTracking", "_hsenc", "_hsmi", "mkt_tok", "igshid",
+}
 
 # Local cache file (source scores only — seen_events dedup handled by WP)
 SOURCE_SCORES_FILE = "source_scores.json"
 
-# Priority regions — combined into one call where possible
+# Priority regions — one API call each to prevent response truncation.
+# Asia, Africa, and Oceania are separate: combining them caused EOF truncation.
 REGION_BATCHES = [
     "Europe",
     "North America and South America",
-    "Asia, Africa, and Oceania",
+    "Asia",
+    "Africa and Oceania",
 ]
 
 # Valid fixed-list values (must match ACF field choices exactly)
@@ -203,6 +216,104 @@ def save_json_file(path: str, data: any):
 
 # seen_events.json local dedup removed — WP-side event_link lookup handles dedup.
 # See wp_get_existing_event() which checks sfse_event_link meta before creating.
+
+
+# ─── URL canonicalisation ────────────────────────────────────────────────────────
+
+def canonicalise_url(url: str) -> str:
+    """
+    Normalise an event URL so that variants of the same page compare equal.
+
+    Transformations applied:
+      - Lowercase scheme and host
+      - Strip www. prefix
+      - Force https://
+      - Strip trailing slash from path
+      - Remove known tracking query parameters (utm_*, fbclid, ref, etc.)
+      - Sort remaining query parameters for stable comparison
+      - Strip fragment (#...)
+
+    Returns the original url unchanged on any parse error.
+    """
+    if not url:
+        return url
+    try:
+        p = urllib.parse.urlparse(url.strip())
+        scheme = "https"
+        host   = p.netloc.lower().lstrip("www.")
+        path   = p.path.rstrip("/") or "/"
+        # Strip tracking params, keep everything else, sort for stability
+        qs_pairs = [
+            (k, v)
+            for k, v in urllib.parse.parse_qsl(p.query)
+            if k.lower() not in URL_TRACKING_PARAMS
+        ]
+        qs_pairs.sort()
+        query = urllib.parse.urlencode(qs_pairs)
+        return urllib.parse.urlunparse((scheme, host, path, "", query, ""))
+    except Exception:
+        return url
+
+
+# ─── Cost normalisation ──────────────────────────────────────────────────────────
+
+# Strings (lowercased, stripped) that unambiguously mean "free"
+_FREE_COST_STRINGS = {
+    "free", "free to attend", "free of charge", "free registration",
+    "free entry", "no fee", "no cost", "no registration fee",
+    "open to all", "gratis", "gratuit", "gratuito", "gratuïts",
+    "kostenlos", "kostenfrei", "gratulito", "бесплатно",
+    "0", "€0", "$0", "£0", "€ 0", "$ 0", "£ 0", "eur 0", "usd 0",
+}
+
+# Strings (lowercased, stripped) that mean "unknown" — store as None
+_UNKNOWN_COST_STRINGS = {
+    "tbd", "tba", "to be announced", "to be confirmed", "to be determined",
+    "see website", "see registration", "check website", "visit website",
+    "contact us", "contact organiser", "contact organizer",
+    "n/a", "na", "-", "—", "?",
+}
+
+def normalise_cost(raw: str) -> Optional[str]:
+    """
+    Normalise a raw cost string to one of:
+      "free"     — confirmed free
+      "From €X"  — lowest confirmed price (already formatted by Claude)
+      None       — genuinely unknown
+
+    Free detection uses substring matching so "attendance is free" is caught
+    even when the agent returns the surrounding sentence rather than just the value.
+    """
+    if raw is None:
+        return None
+
+    v = str(raw).strip()
+    if not v:
+        return None
+
+    vl = v.lower()
+
+    # Exact match against known-free set
+    if vl in _FREE_COST_STRINGS:
+        return "free"
+
+    # Substring match — catches "Registration is free", "Attendance is free of charge"
+    for fragment in ("free to attend", "free of charge", "free registration",
+                     "free entry", "no fee", "no cost", "gratis", "gratuit",
+                     "gratuito", "kostenlos", "kostenfrei"):
+        if fragment in vl:
+            return "free"
+
+    # Unknown / placeholder
+    if vl in _UNKNOWN_COST_STRINGS:
+        return None
+    for fragment in ("tbd", "tba", "to be announced", "see website",
+                     "contact us", "contact organis"):
+        if fragment in vl:
+            return None
+
+    # Looks like a real price — keep as-is
+    return v
 
 
 # ─── Source quality tracker ─────────────────────────────────────────────────────
@@ -363,7 +474,20 @@ EVENT_LINK RULES — critical, read carefully:
 - event_link must be the URL of the organiser's own event page, not the listing or aggregator page where you found it.
 - source_url is where you found the event (the listing/aggregator page). event_link is where the event actually lives.
 - If you only have a listing page URL, search for the event by name to find the organiser's own URL and use that as event_link.
-- Never set event_link to the same domain as source_url unless the organiser genuinely hosts their events on that platform (e.g. Eventbrite, Meetup)."""
+- Never set event_link to the same domain as source_url unless the organiser genuinely hosts their events on that platform (e.g. Eventbrite, Meetup).
+
+CROSS-CONTAMINATION RULE — critical:
+- Each JSON object must be internally consistent. The title, description, organiser, date, location, event_link, and source_url must all refer to the exact same single event.
+- Never copy a field from one event into another event's object.
+- If you are unsure which event a field belongs to, omit that field (use null) rather than guessing.
+- Double-check before closing each object: does every field in this object describe the same event as the title?
+
+COST RULES — critical, read carefully:
+- cost is what a general attendee pays. Look for price information on the event page, near registration buttons, or in a "tickets" or "pricing" section.
+- If the event is free, registration is free, or attendance is free: set cost to "free". Look for phrases like "free to attend", "free registration", "no fee", "no registration fee", "open to all", "gratuit", "gratis", "kostenlos", "gratuito", "free of charge" anywhere on the page.
+- If multiple ticket tiers are shown (early bird, standard, VIP): use the lowest available price, formatted as "From €X" (or local currency).
+- If no price is visible on the page (e.g. hidden behind a registration flow): set cost to null. Do NOT guess or infer a price.
+- Do NOT set cost to strings like "TBD", "See website", "Contact us", "N/A" — use null instead."""
 
     if rejection_examples:
         base += "\n\nEXCLUDE events similar to:\n"
@@ -430,20 +554,29 @@ def clean_json_string(text: str) -> str:
 def search_and_extract(query: str, system_prompt: str) -> list[dict]:
     """
     Send a search query to Claude and return structured event list.
-    Returns [] on any failure. Sets _large_response flag on truncation.
+    Returns [] on any failure. Sets flags on the function object so
+    adaptive_delay() can choose the right wait time.
     """
     log.info(f"  🔍 {query[:100]}...")
     result = _search_and_extract_inner(query, system_prompt)
+    if result == "rate_limited":
+        search_and_extract.last_was_rate_limited = True
+        search_and_extract.last_was_large = False
+        return []
     if result == "large_failure":
+        search_and_extract.last_was_rate_limited = False
         search_and_extract.last_was_large = True
         return []
     if result == "failure":
+        search_and_extract.last_was_rate_limited = False
         search_and_extract.last_was_large = False
         return []
+    search_and_extract.last_was_rate_limited = False
     search_and_extract.last_was_large = len(result) >= 3
     return result
 
 search_and_extract.last_was_large = False
+search_and_extract.last_was_rate_limited = False
 
 
 def _search_and_extract_inner(query: str, system_prompt: str):
@@ -495,35 +628,46 @@ def _search_and_extract_inner(query: str, system_prompt: str):
             return "large_failure" if problem_char == "EOF" else "failure"
 
     except Exception as e:
+        err_str = str(e)
+        if "429" in err_str or "rate_limit" in err_str.lower():
+            log.error(f"  ❌ Rate limit hit (all retries exhausted): {err_str[:120]}")
+            return "rate_limited"
         log.error(f"  ❌ Claude API error: {e}")
         return "failure"
 
 
 # ─── Image fetch ────────────────────────────────────────────────────────────────
 
+# ─── Image fetch ────────────────────────────────────────────────────────────────
+
 def fetch_event_image_url(event_url: str) -> Optional[str]:
     """
-    Read the og:image (or twitter:image fallback) from an event page's <head>.
+    Extract the best available banner image URL from an event page.
 
-    Why og:image?
-      The organiser deliberately sets this tag so their promotional banner
-      appears when someone shares the event link on social media. It is the
-      image they want seen — we display it with attribution, never copy it.
+    Three layers tried in order (all use the same single HTTP fetch):
 
-    Why no Claude call?
-      This is pure HTTP + regex on the first 50 KB of HTML. Zero API tokens.
+      Layer 1 — og:image / twitter:image meta tags
+        The organiser's intended social-share banner. Best signal, zero extra cost.
 
-    Returns the absolute image URL, or None on any failure.
-    Never raises — all errors are logged at DEBUG level so a missing image
-    never blocks an event from being published.
+      Layer 2 — <img> tags with hero/banner class or id signals
+        Catches sites (e.g. Forum for the Future of Agriculture) where the event
+        banner is a regular <img> inside a hero section.
+
+      Layer 3 — CSS background-image on hero/header/banner elements
+        Catches sites (e.g. Reuters Events) where the hero is a full-bleed CSS
+        background div with no <img> tag at all.
+
+    All three layers share one HTTP request (streaming, capped at 100 KB).
+    Logo/icon images are filtered out at each layer.
+    Never raises — all errors are logged at DEBUG level.
     """
     if not event_url:
         return None
 
     try:
         headers = {
-            "User-Agent": IMAGE_FETCH_UA,
-            "Accept":     "text/html,application/xhtml+xml",
+            "User-Agent":     IMAGE_FETCH_UA,
+            "Accept":         "text/html,application/xhtml+xml",
             "Accept-Language": "en",
         }
         r = requests.get(
@@ -531,7 +675,7 @@ def fetch_event_image_url(event_url: str) -> Optional[str]:
             headers=headers,
             timeout=IMAGE_FETCH_TIMEOUT,
             allow_redirects=True,
-            stream=True,      # streaming so we can stop early
+            stream=True,
         )
 
         if r.status_code != 200:
@@ -543,41 +687,88 @@ def fetch_event_image_url(event_url: str) -> Optional[str]:
             log.debug(f"  🖼  Not HTML ({content_type}): {event_url}")
             return None
 
-        # Read only what we need — <head> is always within the first 50 KB
+        # Single fetch — 100 KB captures <head> + opening body hero content
         partial = b""
         for chunk in r.iter_content(chunk_size=4096):
             partial += chunk
             if len(partial) >= IMAGE_HEAD_MAX_BYTES:
                 break
-            if b"</head>" in partial or b"<body" in partial:
-                break  # stop as soon as we're past the head
 
         html = partial.decode("utf-8", errors="replace")
 
-        # ── Try og:image ──────────────────────────────────────────────────────
-        # Two patterns: property before content, and content before property
+        # ── Layer 1: og:image / twitter:image ────────────────────────────────
         for pattern in (
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
             r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-        ):
-            m = re.search(pattern, html, re.IGNORECASE)
-            if m:
-                img = _make_absolute(m.group(1).strip(), event_url)
-                if not _is_logo_url(img):
-                    return img
-
-        # ── Fallback: twitter:image ───────────────────────────────────────────
-        for pattern in (
             r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
             r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
         ):
             m = re.search(pattern, html, re.IGNORECASE)
             if m:
                 img = _make_absolute(m.group(1).strip(), event_url)
-                if not _is_logo_url(img):
+                if _is_logo_url(img, alt=""):
+                    continue
+                # Validate the URL is reachable before returning —
+                # some sites set og:image to a broken or placeholder URL
+                if not _is_valid_image_url(img):
+                    log.debug(f"  🖼  Layer 1 og:image broken (falling through): {img[:80]}")
+                    continue
+                log.debug(f"  🖼  Layer 1 (og/twitter): {img[:80]}")
+                return img
+
+        # ── Layer 2: <img> with hero/banner signals in class, id, or alt ─────
+        # Match <img> tags and extract src, class, id, alt attributes
+        _HERO_SIGNALS = re.compile(
+            r'\b(hero|banner|featured|event[\-_]image|cover|header[\-_]image|'
+            r'promo|highlight|main[\-_]image|key[\-_]visual)\b',
+            re.IGNORECASE,
+        )
+        for img_tag in re.finditer(r'<img\b([^>]{10,}?)(?:/>|>)', html, re.IGNORECASE | re.DOTALL):
+            attrs = img_tag.group(1)
+            # Must have a hero/banner signal in class, id, or alt
+            cls  = _attr(attrs, "class")
+            id_  = _attr(attrs, "id")
+            alt  = _attr(attrs, "alt")
+            if not _HERO_SIGNALS.search(cls + " " + id_ + " " + alt):
+                continue
+            src = _attr(attrs, "src") or _attr(attrs, "data-src") or _attr(attrs, "data-lazy-src")
+            if not src:
+                continue
+            img = _make_absolute(src.strip(), event_url)
+            if not _is_logo_url(img, alt=alt):
+                log.debug(f"  🖼  Layer 2 (img hero): {img[:80]}")
+                return img
+
+        # ── Layer 3: CSS background-image on hero/header/banner elements ──────
+        _BG_HERO_SIGNALS = re.compile(
+            r'\b(hero|banner|header|cover|jumbotron|masthead|splash|'
+            r'event[\-_]image|featured[\-_]image|set-as-event-image)\b',
+            re.IGNORECASE,
+        )
+        _BG_URL = re.compile(
+            r'background(?:-image)?\s*:\s*url\(["\']?([^"\')\s]+)["\']?\)',
+            re.IGNORECASE,
+        )
+        # Scan elements that carry a hero/banner class or id
+        for el_match in re.finditer(
+            r'<(?:div|section|header|figure|article)\b([^>]*?)>',
+            html, re.IGNORECASE | re.DOTALL
+        ):
+            el_attrs = el_match.group(1)
+            cls = _attr(el_attrs, "class")
+            id_ = _attr(el_attrs, "id")
+            if not _BG_HERO_SIGNALS.search(cls + " " + id_):
+                continue
+            # Look for background-image in inline style on this same element
+            style = _attr(el_attrs, "style")
+            bg_m  = _BG_URL.search(style)
+            if bg_m:
+                img = _make_absolute(bg_m.group(1).strip(), event_url)
+                if not _is_logo_url(img, alt=""):
+                    log.debug(f"  🖼  Layer 3 (CSS bg): {img[:80]}")
                     return img
 
-        log.debug(f"  🖼  No og:image or twitter:image at {event_url}")
+        log.debug(f"  🖼  No banner found at {event_url}")
         return None
 
     except requests.exceptions.Timeout:
@@ -588,18 +779,50 @@ def fetch_event_image_url(event_url: str) -> Optional[str]:
         return None
 
 
+def _attr(tag_attrs: str, name: str) -> str:
+    """Extract a single attribute value from a tag's attribute string."""
+    m = re.search(
+        rf'\b{re.escape(name)}\s*=\s*(?:"([^"]*?)"|\'([^\']*?)\'|(\S+?)(?:\s|>|$))',
+        tag_attrs, re.IGNORECASE
+    )
+    if not m:
+        return ""
+    return (m.group(1) or m.group(2) or m.group(3) or "").strip()
+
+
 # Filename fragments that indicate a site logo or icon rather than an event banner.
-# og:image is sometimes set to a site-wide logo — these are useless as event images.
-_LOGO_URL_FRAGMENTS = (
-    "logo", "favicon", "icon", "avatar",
-    "cropped-logo", "site-logo", "brand",
+_LOGO_FILENAME_FRAGMENTS = (
+    "logo", "favicon", "icon", "avatar", "site-logo", "brand",
+    "placeholder", "default-image", "no-image",
 )
 
-def _is_logo_url(url: str) -> bool:
-    """Return True if the image URL looks like a site logo rather than an event banner."""
-    path = urllib.parse.urlparse(url).path.lower()
-    filename = path.rsplit("/", 1)[-1]   # just the filename portion
-    return any(frag in filename for frag in _LOGO_URL_FRAGMENTS)
+# WordPress thumbnail crop prefix — almost always a logo crop, not an event banner
+_LOGO_FILENAME_PREFIXES = ("cropped-",)
+
+
+def _is_logo_url(url: str, alt: str = "") -> bool:
+    """
+    Return True if the image looks like a site logo/icon rather than an event banner.
+
+    Checks:
+      1. Filename-only fragments (not the full path — avoids false positives on
+         paths like /uploads/2026/logo-event-photo.jpg)
+      2. WordPress cropped- prefix (almost always a logo resized for the header)
+      3. Alt text containing 'logo' or 'icon' (explicit labelling)
+    """
+    try:
+        path     = urllib.parse.urlparse(url).path.lower()
+        filename = path.rsplit("/", 1)[-1]  # filename only
+    except Exception:
+        filename = url.lower()
+
+    if any(frag in filename for frag in _LOGO_FILENAME_FRAGMENTS):
+        return True
+    if any(filename.startswith(pfx) for pfx in _LOGO_FILENAME_PREFIXES):
+        return True
+    if alt and re.search(r'\b(logo|icon|favicon)\b', alt, re.IGNORECASE):
+        return True
+    return False
 
 
 def _make_absolute(img_url: str, base_url: str) -> str:
@@ -633,14 +856,15 @@ def enrich_events_with_images(events: list[dict]) -> None:
             img_url = fetch_event_image_url(event_link)
 
         # 2. Fallback: source_url if event_link yielded nothing.
-        # The same-domain guard was removed because with event_link now write-once
-        # and pointing to the organiser's own page, source_url is typically a
-        # different domain anyway. The logo filter in fetch_event_image_url
-        # handles the case where source_url returns a site-wide branding image.
         if not img_url and source_url and source_url != event_link:
             img_url = fetch_event_image_url(source_url)
             if img_url:
                 log.info(f"  🖼  Image via source_url fallback: '{title}'")
+
+        # Guard: never store data URIs, SVG placeholders, or non-HTTP URLs
+        if img_url and not _is_valid_image_url(img_url):
+            log.warning(f"  ⚠️  Rejecting invalid image URL for '{title}': {img_url[:60]}")
+            img_url = None
 
         event["image_url"] = img_url
 
@@ -704,6 +928,15 @@ def normalise_event(event: dict) -> Optional[dict]:
     raw_langs = event.get("event_languages") or []
     event["event_languages"] = [l for l in raw_langs if l in VALID_LANGUAGES]
 
+    # Normalise cost
+    event["cost"] = normalise_cost(event.get("cost"))
+
+    # Canonicalise URLs — consistent form for dedup and storage
+    if event.get("event_link"):
+        event["event_link"] = canonicalise_url(event["event_link"])
+    if event.get("source_url"):
+        event["source_url"] = canonicalise_url(event["source_url"])
+
     return event
 
 
@@ -711,19 +944,27 @@ def wp_auth():
     return (WP_USERNAME, WP_APP_PASSWORD)
 
 
-def wp_get_existing_event(title: str, date_start: str, event_link: str = '') -> Optional[dict]:
+def wp_get_existing_event(title: str, date_start: str, event_link: str = '',
+                          organiser: str = '', city: str = '') -> Optional[dict]:
     """
     Check WordPress for an existing event.
-    Primary: match by event_link URL (most reliable).
-    Fallback: match by title + date_start.
+
+    Three checks in order:
+      1. event_link URL match (canonical form — most reliable)
+      2. title + date_start exact match (fallback for events without a link)
+      3. organiser + date_start + city match (catches same event found via
+         two different URLs with different titles)
+
     Returns the WP post dict or None.
     """
+    canonical_link = canonicalise_url(event_link) if event_link else ""
+
     try:
-        # Primary: search by event_link meta
-        if event_link:
+        # ── 1. Match by canonical event_link ─────────────────────────────────
+        if canonical_link:
             r = requests.get(
                 f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
-                params={"meta_key": "sfse_event_link", "meta_value": event_link, "per_page": 2},
+                params={"meta_key": "sfse_event_link", "meta_value": canonical_link, "per_page": 2},
                 auth=wp_auth(),
                 timeout=10,
             )
@@ -732,26 +973,47 @@ def wp_get_existing_event(title: str, date_start: str, event_link: str = '') -> 
                 if posts:
                     return posts[0]
 
-        # Fallback: search by title + date
+        # ── 2. Match by title + date ──────────────────────────────────────────
         r = requests.get(
             f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
             params={"search": title[:50], "per_page": 5},
             auth=wp_auth(),
             timeout=10,
         )
-        if r.status_code != 200:
-            return None
-        posts = r.json()
-        date_prefix = date_start[:10]
-        for post in posts:
-            existing_title = post.get("title", {}).get("rendered", "").strip()
-            existing_start = post.get("meta", {}).get("sfse_date_start", "")[:10]
-            if (
-                existing_title.lower() == title.lower().strip()
-                and existing_start == date_prefix
-            ):
-                return post
+        if r.status_code == 200:
+            posts = r.json()
+            date_prefix = date_start[:10]
+            for post in posts:
+                existing_title = post.get("title", {}).get("rendered", "").strip()
+                existing_start = post.get("meta", {}).get("sfse_date_start", "")[:10]
+                if (
+                    existing_title.lower() == title.lower().strip()
+                    and existing_start == date_prefix
+                ):
+                    return post
+
+        # ── 3. Match by organiser + date + city ───────────────────────────────
+        if organiser and date_start and city:
+            r = requests.get(
+                f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
+                params={"meta_key": "sfse_organiser", "meta_value": organiser, "per_page": 10},
+                auth=wp_auth(),
+                timeout=10,
+            )
+            if r.status_code == 200:
+                posts = r.json()
+                date_prefix = date_start[:10]
+                for post in posts:
+                    meta = post.get("meta", {})
+                    if (
+                        meta.get("sfse_date_start", "")[:10] == date_prefix
+                        and meta.get("sfse_city", "").lower() == city.lower().strip()
+                    ):
+                        log.info(f"  🔁 Dedup via organiser+date+city: {title}")
+                        return post
+
         return None
+
     except Exception as e:
         log.warning(f"WP existence check failed: {e}")
         return None
@@ -858,17 +1120,31 @@ def build_wp_update_payload(event: dict, existing_meta: dict) -> Optional[dict]:
     return payload
 
 
-def post_event(event: dict) -> str:
+def post_event(event: dict, seen_urls: set) -> str:
     """
     Create or update a WordPress event post.
     Returns: 'created' | 'updated' | 'unchanged' | 'failed'
+
+    seen_urls: in-memory set of canonical event_link URLs already processed
+               this run — prevents within-run duplicates when the same event
+               appears in both a known source and a discovery search.
     """
     title      = event.get("title", "")
     date_start = event.get("date_start", "")
     event_link = event.get("event_link", "")
+    organiser  = event.get("organiser", "")
+    city       = event.get("city", "")
 
-    # Check for existing post — use event_link as primary key
-    existing = wp_get_existing_event(title, date_start, event_link)
+    # Within-run dedup — canonical URL already processed this session
+    canonical = canonicalise_url(event_link) if event_link else ""
+    if canonical and canonical in seen_urls:
+        log.info(f"  ⏭️  Within-run duplicate (skipped): {title}")
+        return "unchanged"
+    if canonical:
+        seen_urls.add(canonical)
+
+    # Check for existing post in WordPress
+    existing = wp_get_existing_event(title, date_start, event_link, organiser, city)
 
     if existing:
         existing_meta  = existing.get("meta", {})
@@ -915,9 +1191,24 @@ def post_event(event: dict) -> str:
 
 
 def adaptive_delay(event_count: int):
-    """Wait longer after large or failed-large responses to avoid rate limits."""
-    is_large = search_and_extract.last_was_large or event_count >= 5
-    delay = API_CALL_DELAY_LARGE if is_large else API_CALL_DELAY
+    """
+    Wait before the next API call.
+
+    Delay selection:
+      - After a 429 rate-limit failure : API_CALL_DELAY_AFTER_429 (3 min)
+        The SDK already retried 3× internally (~40s total). We add 3 more
+        minutes so the token-per-minute budget fully resets.
+      - After a large response (≥3 events) : API_CALL_DELAY_LARGE (2 min)
+        Large responses consume most of the TPM budget.
+      - Otherwise                          : API_CALL_DELAY (65s)
+    """
+    if search_and_extract.last_was_rate_limited:
+        delay = API_CALL_DELAY_AFTER_429
+        search_and_extract.last_was_rate_limited = False  # reset after use
+    elif search_and_extract.last_was_large or event_count >= 5:
+        delay = API_CALL_DELAY_LARGE
+    else:
+        delay = API_CALL_DELAY
     log.info(f"  ⏳ Waiting {delay}s before next API call...")
     time.sleep(delay)
 
@@ -976,7 +1267,7 @@ def fetch_wp_run_interval() -> int:
 
 def record_last_agent_run():
     """Write the current UTC timestamp to sfse_last_agent_run in WordPress."""
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     try:
         r = requests.post(
             f"{WP_BASE_URL}/wp-json/wp/v2/settings",
@@ -1009,28 +1300,53 @@ def clear_wp_manual_urls():
 
 
 
+def _is_valid_image_url(url: str) -> bool:
+    """
+    Return True if a stored image URL is still reachable (HTTP HEAD, status 200).
+    Returns False for data URIs, non-HTTP schemes, and any non-200 response.
+    Fast: HEAD request downloads no body. Times out after 6 seconds.
+    Never raises.
+    """
+    if not url:
+        return False
+    # Reject data URIs and non-HTTP schemes immediately — no network call needed
+    if url.startswith("data:") or not url.startswith(("http://", "https://")):
+        return False
+    try:
+        r = requests.head(
+            url,
+            headers={"User-Agent": IMAGE_FETCH_UA},
+            timeout=6,
+            allow_redirects=True,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def backfill_missing_images(max_events: int = 20) -> None:
     """
-    Retrofit og:image banners onto existing published WP events that have
-    an event_link but no sfse_image_url.
+    Two-pass image maintenance on existing published WP events:
 
-    Called once at the start of each run. Uses the same fetch logic as new
-    events. Capped at max_events per run so it does not dominate the runtime
-    — remaining events are picked up on subsequent runs until all are filled.
+    Pass 1 — Validate existing image URLs (cap: max_events).
+      Events where sfse_image_url is set but the URL is broken (non-200,
+      data URI, unreachable) have the field cleared so Pass 2 can refetch.
 
-    This is necessary because image enrichment only runs on events extracted
-    in the current run. Existing posts created before image support was added,
-    or whose image fetch previously failed, need this separate pass.
+    Pass 2 — Backfill empty slots (cap: max_events).
+      Events with an event_link but no sfse_image_url get a fresh fetch.
+      Same layer-1/2/3 logic as new events.
+
+    Both passes share the same cap so a run with many broken URLs does not
+    crowd out genuine new backfills. Remaining events are picked up on the
+    next run.
     """
-    log.info(f"\n🖼  Backfilling images for existing events (cap: {max_events})...")
+    log.info(f"\n🖼  Image maintenance for existing events (cap: {max_events} per pass)...")
 
+    # ── Shared: page through all published events ─────────────────────────────
     try:
-        # Fetch published events that have event_link but empty image_url.
-        # WP REST does not support "meta field is empty" natively, so we
-        # fetch in pages and filter client-side.
-        candidates = []
+        all_posts = []
         page = 1
-        while len(candidates) < max_events:
+        while True:
             r = requests.get(
                 f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
                 params={
@@ -1045,40 +1361,80 @@ def backfill_missing_images(max_events: int = 20) -> None:
             if r.status_code == 400:
                 break  # past last page
             if r.status_code != 200:
-                log.warning(f"  ⚠️  Backfill fetch failed ({r.status_code})")
+                log.warning(f"  ⚠️  Image maintenance fetch failed ({r.status_code})")
                 break
-
             posts = r.json()
             if not posts:
                 break
-
-            for post in posts:
-                meta       = post.get("meta", {})
-                event_link = meta.get("sfse_event_link", "")
-                image_url  = meta.get("sfse_image_url",  "")
-                if event_link and not image_url:
-                    candidates.append({
-                        "id":         post["id"],
-                        "event_link": event_link,
-                    })
-                    if len(candidates) >= max_events:
-                        break
-
-            # Stop paging if we got a partial page — no more pages exist
+            all_posts.extend(posts)
             if len(posts) < 50:
                 break
             page += 1
-
     except Exception as e:
-        log.warning(f"  ⚠️  Backfill query error: {e}")
+        log.warning(f"  ⚠️  Image maintenance query error: {e}")
         return
+
+    if not all_posts:
+        log.info("   No published events found")
+        return
+
+    # ── Pass 1: validate existing image URLs ──────────────────────────────────
+    broken = []
+    for post in all_posts:
+        meta      = post.get("meta", {})
+        image_url = meta.get("sfse_image_url", "")
+        if image_url:
+            broken.append({"id": post["id"], "image_url": image_url})
+        if len(broken) >= max_events:
+            break
+
+    cleared = 0
+    if broken:
+        log.info(f"   Pass 1: validating {len(broken)} stored image URL(s)...")
+        for item in broken:
+            if not _is_valid_image_url(item["image_url"]):
+                try:
+                    r = requests.post(
+                        f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events/{item['id']}",
+                        json={"meta": {"sfse_image_url": ""}},
+                        auth=wp_auth(),
+                        timeout=15,
+                    )
+                    if r.status_code in (200, 201):
+                        log.info(f"  🗑️  Cleared broken image on post {item['id']}: {item['image_url'][:70]}")
+                        cleared += 1
+                        # Mark as empty so Pass 2 picks it up
+                        item["_cleared"] = True
+                    else:
+                        log.warning(f"  ⚠️  Could not clear image on post {item['id']} ({r.status_code})")
+                except Exception as e:
+                    log.warning(f"  ⚠️  Clear error for post {item['id']}: {e}")
+            time.sleep(0.3)
+        log.info(f"   Pass 1 complete: {cleared} broken URL(s) cleared")
+    else:
+        log.info("   Pass 1: no stored image URLs to validate")
+
+    # ── Pass 2: backfill empty slots ──────────────────────────────────────────
+    candidates = []
+    for post in all_posts:
+        meta       = post.get("meta", {})
+        event_link = meta.get("sfse_event_link", "")
+        image_url  = meta.get("sfse_image_url", "")
+        # Include if: no image stored, OR image was just cleared in Pass 1
+        already_cleared = any(
+            b["id"] == post["id"] and b.get("_cleared")
+            for b in broken
+        )
+        if event_link and (not image_url or already_cleared):
+            candidates.append({"id": post["id"], "event_link": event_link})
+        if len(candidates) >= max_events:
+            break
 
     if not candidates:
-        log.info("   No events need image backfill")
+        log.info("   Pass 2: no events need image backfill")
         return
 
-    log.info(f"   Found {len(candidates)} event(s) without image — fetching...")
-
+    log.info(f"   Pass 2: backfilling {len(candidates)} event(s)...")
     filled = 0
     for item in candidates:
         post_id    = item["id"]
@@ -1090,7 +1446,12 @@ def backfill_missing_images(max_events: int = 20) -> None:
             time.sleep(0.5)
             continue
 
-        # Patch just sfse_image_url — nothing else touched
+        # Guard: never store data URIs or non-HTTP URLs
+        if not _is_valid_image_url(img_url):
+            log.warning(f"  ⚠️  Skipping invalid image URL for post {post_id}: {img_url[:60]}")
+            time.sleep(0.5)
+            continue
+
         try:
             r = requests.post(
                 f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events/{post_id}",
@@ -1106,9 +1467,194 @@ def backfill_missing_images(max_events: int = 20) -> None:
         except Exception as e:
             log.warning(f"  ⚠️  Backfill patch error for post {post_id}: {e}")
 
-        time.sleep(0.5)  # polite pace
+        time.sleep(0.5)
 
-    log.info(f"   Backfill complete: {filled}/{len(candidates)} images added")
+    log.info(f"   Pass 2 complete: {filled}/{len(candidates)} image(s) added")
+
+
+# ─── Known event links (Option C dedup) ────────────────────────────────────────
+
+def fetch_wp_known_event_links() -> set:
+    """
+    Fetch all sfse_event_link values from published WordPress events.
+
+    Used to filter pass-1 candidates before pass-2 deep search, so we only
+    fan out from genuinely new events and don't waste API calls on events
+    already in WordPress.
+
+    Returns a set of canonicalised URLs. Empty set on any failure (safe —
+    dedup falls back to the per-event WP check in post_event()).
+    """
+    known: set = set()
+    page = 1
+    try:
+        while True:
+            r = requests.get(
+                f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
+                params={
+                    "status":   "any",
+                    "per_page": 100,
+                    "page":     page,
+                    "_fields":  "meta",
+                },
+                auth=wp_auth(),
+                timeout=15,
+            )
+            if r.status_code == 400:
+                break  # past last page
+            if r.status_code != 200:
+                log.warning(f"  ⚠️  Known links fetch failed ({r.status_code})")
+                break
+            posts = r.json()
+            if not posts:
+                break
+            for post in posts:
+                link = post.get("meta", {}).get("sfse_event_link", "")
+                if link:
+                    known.add(canonicalise_url(link))
+            if len(posts) < 100:
+                break
+            page += 1
+    except Exception as e:
+        log.warning(f"  ⚠️  Could not fetch known event links: {e}")
+
+    log.info(f"   Known event links loaded: {len(known)}")
+    return known
+
+
+def filter_known_events(events: list[dict], known_links: set) -> tuple[list[dict], int]:
+    """
+    Remove events whose canonical event_link is already in WordPress.
+    Returns (new_events, skipped_count).
+    """
+    new, skipped = [], 0
+    for event in events:
+        link = canonicalise_url(event.get("event_link") or "")
+        if link and link in known_links:
+            log.info(f"  ⏭️  Already in WP (skipped): {event.get('title', link)[:60]}")
+            skipped += 1
+        else:
+            new.append(event)
+    return new, skipped
+
+
+# ─── Deep search pass 2 (Option E) ─────────────────────────────────────────────
+
+def build_deep_search_queries(new_events: list[dict], known_links: set) -> list[str]:
+    """
+    Generate targeted follow-up search queries from pass-1 discoveries.
+
+    Seed extraction: from each new event pull organiser, primary topic,
+    and country. Deduplicate seeds so one prolific organiser doesn't
+    consume the entire query budget.
+
+    Query selection per seed:
+      - New organiser (not yet in WP):  organiser sweep + topic/region drill
+      - Known organiser (already in WP): organiser sweep only
+      - Online event:                   topic drill + NGO/network co-occurrence
+      - In-person, specific city:       topic drill + city ripple
+
+    Total queries capped at DEEP_SEARCH_MAX_QUERIES.
+    Seeds prioritised: new organisers first, then underrepresented topics,
+    then countries with few existing events.
+    """
+    if not new_events:
+        return []
+
+    queries: list[str] = []
+    seen_organisers: set = set()
+    seen_topic_country: set = set()
+
+    # Collect existing organisers from WP for novelty check
+    existing_organisers: set = set()
+    try:
+        r = requests.get(
+            f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
+            params={"status": "any", "per_page": 100, "_fields": "meta"},
+            auth=wp_auth(),
+            timeout=15,
+        )
+        if r.status_code == 200:
+            for post in r.json():
+                org = post.get("meta", {}).get("sfse_organiser", "")
+                if org:
+                    existing_organisers.add(org.lower().strip())
+    except Exception:
+        pass  # non-fatal — novelty check degrades gracefully
+
+    # Prioritise: new organisers first
+    def seed_priority(event):
+        org = (event.get("organiser") or "").lower().strip()
+        is_new_org = org and org not in existing_organisers
+        return (0 if is_new_org else 1)
+
+    sorted_events = sorted(new_events, key=seed_priority)
+
+    for event in sorted_events:
+        if len(queries) >= DEEP_SEARCH_MAX_QUERIES:
+            break
+
+        organiser = (event.get("organiser") or "").strip()
+        topics    = event.get("topics") or []
+        topic     = topics[0] if topics else "sustainable food systems"
+        country   = event.get("country") or ""
+        fmt       = event.get("format") or "in-person"
+        city      = (event.get("city") or "").strip()
+        org_key   = organiser.lower()
+
+        is_new_org = org_key and org_key not in existing_organisers
+        topic_country_key = f"{topic}:{country}"
+
+        # ── Organiser sweep (one per organiser) ──────────────────────────────
+        if organiser and org_key not in seen_organisers:
+            seen_organisers.add(org_key)
+            queries.append(
+                f"Find all upcoming events organised or co-organised by {organiser!r} "
+                f"between {SEARCH_FROM} and {SEARCH_TO}. "
+                f"Return only events not already covered by your previous searches. "
+                f"For each event find the organiser's own event page URL."
+            )
+            if len(queries) >= DEEP_SEARCH_MAX_QUERIES:
+                break
+
+        # ── Topic + region drill (one per topic/country combination) ─────────
+        if topic_country_key not in seen_topic_country:
+            seen_topic_country.add(topic_country_key)
+
+            if fmt == "online":
+                queries.append(
+                    f"Find upcoming online events, webinars, and virtual workshops "
+                    f"about {topic.replace('_', ' ')} "
+                    f"between {SEARCH_FROM} and {SEARCH_TO}. "
+                    f"Focus on events organised by NGOs, UN agencies, farmer networks, "
+                    f"universities, and civil society — not major commercial conferences. "
+                    f"For each event find the organiser's own event page URL."
+                )
+            elif country and country != "ONLINE":
+                region_label = COUNTRY_TO_CONTINENT.get(country.upper(), country)
+                queries.append(
+                    f"Find upcoming {topic.replace('_', ' ')} events in {region_label} "
+                    f"between {SEARCH_FROM} and {SEARCH_TO}. "
+                    f"Focus on workshops, training courses, community events, field days, "
+                    f"and local festivals — not the large international conferences. "
+                    f"For each event find the organiser's own event page URL."
+                )
+
+            if len(queries) >= DEEP_SEARCH_MAX_QUERIES:
+                break
+
+        # ── City ripple (in-person only, specific city known) ─────────────────
+        if fmt == "in-person" and city and len(queries) < DEEP_SEARCH_MAX_QUERIES:
+            queries.append(
+                f"Find other sustainable food system events taking place in or near "
+                f"{city} between {SEARCH_FROM} and {SEARCH_TO}. "
+                f"Include any format: conferences, markets, workshops, community events. "
+                f"For each event find the organiser's own event page URL."
+            )
+
+    log.info(f"   Deep search queries generated: {len(queries)}")
+    return queries
+
 
 
 # ─── Main agent run ─────────────────────────────────────────────────────────────
@@ -1128,11 +1674,14 @@ def run_agent():
     # ── 0. Backfill images onto existing events that have none ──────────────
     backfill_missing_images(max_events=20)
 
-    # ── 1. Load rejection feedback from WordPress ────────────────────────────
+    # ── 1. Load rejection feedback + known event links from WordPress ────────
     log.info("\n📋 Loading rejection feedback from WordPress...")
     rejection_examples = load_rejection_examples()
     log.info(f"   {len(rejection_examples)} rejection examples loaded")
     system_prompt = build_system_prompt(rejection_examples)
+
+    log.info("\n🗂  Loading known event links from WordPress...")
+    known_links = fetch_wp_known_event_links()
 
     # ── 2. Process manual event URLs from WP settings ───────────────────────
     manual_urls = fetch_wp_manual_urls()
@@ -1214,7 +1763,7 @@ def run_agent():
         record_source_outcome(source_url, source_scores, published=0, rejected=0)
         adaptive_delay(len(events))
 
-    # ── 4. Discovery searches ────────────────────────────────────────────────
+    # ── 4. Discovery searches (pass 1) ───────────────────────────────────────
     if len(all_events) < MAX_CANDIDATES:
         log.info(f"\n🌍 Running discovery searches across priority regions...")
         for region_batch in REGION_BATCHES:
@@ -1237,36 +1786,74 @@ def run_agent():
             all_events.extend(events)
             adaptive_delay(len(events))
 
-    log.info(f"\n📦 Total raw candidates: {len(all_events)}")
+    log.info(f"\n📦 Pass 1 raw candidates: {len(all_events)}")
 
-    # ── 5. Validate and normalise ────────────────────────────────────────────
-    valid_events = []
+    # ── 5. Validate and normalise pass 1 ────────────────────────────────────
+    valid_pass1 = []
     for event in all_events:
         normalised = normalise_event(event)
         if normalised:
-            valid_events.append(normalised)
+            valid_pass1.append(normalised)
+    log.info(f"✔️  Valid after normalisation: {len(valid_pass1)}")
 
-    log.info(f"✔️  Valid after normalisation: {len(valid_events)}")
+    # ── 6. Filter known events (Option C) — keep only new ones ───────────────
+    log.info(f"\n🔎 Filtering against {len(known_links)} known WordPress events...")
+    new_from_pass1, skipped = filter_known_events(valid_pass1, known_links)
+    log.info(f"   New: {len(new_from_pass1)}  |  Already in WP (skipped): {skipped}")
 
-    # ── 6. WP-side dedup (via event_link meta lookup in post_event) ──────────
-    # Local seen_events.json dedup removed — wp_get_existing_event() checks
-    # sfse_event_link in WordPress before creating, catching all true duplicates.
-    new_events = valid_events
-    log.info(f"📋 Candidates to check against WordPress: {len(new_events)}")
+    # Add new pass-1 events to known_links so pass-2 seeds don't re-find them
+    for event in new_from_pass1:
+        link = canonicalise_url(event.get("event_link") or "")
+        if link:
+            known_links.add(link)
 
-    # ── 7. Fetch promotional banner images ───────────────────────────────────
-    if new_events:
-        log.info(f"\n🖼  Fetching og:image banners for {len(new_events)} event(s)...")
-        enrich_events_with_images(new_events)
-        found = sum(1 for e in new_events if e.get("image_url"))
-        log.info(f"   Banners found: {found}/{len(new_events)}")
+    # ── 7. Deep search pass 2 (Option E) ─────────────────────────────────────
+    deep_queries = build_deep_search_queries(new_from_pass1, known_links)
 
-    # ── 8. Post to WordPress ─────────────────────────────────────────────────
+    pass2_events: list[dict] = []
+    if deep_queries:
+        log.info(f"\n🔬 Deep search pass 2 ({len(deep_queries)} queries)...")
+        for query in deep_queries:
+            if len(pass2_events) + len(new_from_pass1) >= MAX_CANDIDATES:
+                log.info(f"  🛑 Candidate limit reached — stopping deep search")
+                break
+            events = search_and_extract(query, system_prompt)
+            pass2_events.extend(events)
+            adaptive_delay(len(events))
+
+        log.info(f"   Pass 2 raw candidates: {len(pass2_events)}")
+
+        # Normalise pass 2
+        valid_pass2 = []
+        for event in pass2_events:
+            normalised = normalise_event(event)
+            if normalised:
+                valid_pass2.append(normalised)
+
+        # Filter known events again
+        new_from_pass2, skipped2 = filter_known_events(valid_pass2, known_links)
+        log.info(f"   Pass 2 new: {new_from_pass2.__len__()}  |  Already in WP: {skipped2}")
+    else:
+        new_from_pass2 = []
+
+    # ── 8. Combine all new events ─────────────────────────────────────────────
+    all_new_events = new_from_pass1 + new_from_pass2
+    log.info(f"\n📋 Total new events to process: {len(all_new_events)}")
+
+    # ── 9. Fetch promotional banner images ───────────────────────────────────
+    if all_new_events:
+        log.info(f"\n🖼  Fetching og:image banners for {len(all_new_events)} event(s)...")
+        enrich_events_with_images(all_new_events)
+        found = sum(1 for e in all_new_events if e.get("image_url"))
+        log.info(f"   Banners found: {found}/{len(all_new_events)}")
+
+    # ── 10. Post to WordPress ─────────────────────────────────────────────────
     log.info(f"\n🚀 Posting to WordPress...")
-    results = {"created": 0, "updated": 0, "unchanged": 0, "failed": 0}
+    results  = {"created": 0, "updated": 0, "unchanged": 0, "failed": 0}
+    seen_urls: set = set()   # within-run dedup by canonical event_link
 
-    for event in new_events:
-        outcome = post_event(event)
+    for event in all_new_events:
+        outcome = post_event(event, seen_urls)
         results[outcome] += 1
 
         source_url = event.get("source_url", "discovery")
@@ -1277,11 +1864,11 @@ def run_agent():
 
         time.sleep(1)
 
-    # ── 9. Persist state ─────────────────────────────────────────────────────
+    # ── 11. Persist state ─────────────────────────────────────────────────────
     save_source_scores(source_scores)
     record_last_agent_run()
 
-    # ── 10. Summary ──────────────────────────────────────────────────────────
+    # ── 12. Summary ───────────────────────────────────────────────────────────
     log.info("\n" + "=" * 65)
     log.info("✅ Run complete")
     log.info(f"   Created   : {results['created']}")
@@ -1291,7 +1878,38 @@ def run_agent():
     log.info("=" * 65)
 
 
+# ─── Source score reset ─────────────────────────────────────────────────────────
+
+def reset_source_scores():
+    """
+    Clear all source quality scores from WordPress options and local file.
+    Use after correcting known source URLs.
+    Usage: py agent.py --reset-sources
+    """
+    empty = {}
+    try:
+        r = requests.post(
+            f"{WP_BASE_URL}/wp-json/wp/v2/settings",
+            json={"sfse_source_scores": json.dumps(empty)},
+            auth=wp_auth(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            log.info("✅ Source scores cleared in WordPress")
+        else:
+            log.warning(f"⚠️  Could not clear source scores in WP ({r.status_code})")
+    except Exception as e:
+        log.warning(f"⚠️  Could not clear source scores in WP: {e}")
+    save_json_file(SOURCE_SCORES_FILE, empty)
+    log.info("✅ source_scores.json cleared")
+    log.info("   All known sources will be checked on the next run.")
+
+
 # ─── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    run_agent()
+    import sys
+    if "--reset-sources" in sys.argv:
+        reset_source_scores()
+    else:
+        run_agent()

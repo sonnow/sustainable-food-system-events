@@ -173,25 +173,40 @@ add_action( 'init', 'sfse_register_meta_fields' );
 function sfse_register_options() {
 
     register_setting( 'sfse_settings', 'sfse_known_sources', array(
-        'type'         => 'array',
-        'default'      => array(),
-        'show_in_rest' => array(
+        'type'              => 'array',
+        'default'           => array(),
+        'show_in_rest'      => array(
             'schema' => array(
                 'type'  => 'array',
                 'items' => array( 'type' => 'string' ),
             ),
         ),
+        // esc_url_raw preserves URL structure for programmatic use.
+        // Without this, WordPress's default sanitisation can corrupt URLs
+        // (e.g. doubling letters: /events/ → /evvents/).
+        'sanitize_callback' => function( $value ) {
+            if ( ! is_array( $value ) ) {
+                return array();
+            }
+            return array_values( array_filter( array_map( 'esc_url_raw', $value ) ) );
+        },
     ));
 
     register_setting( 'sfse_settings', 'sfse_manual_event_urls', array(
-        'type'         => 'array',
-        'default'      => array(),
-        'show_in_rest' => array(
+        'type'              => 'array',
+        'default'           => array(),
+        'show_in_rest'      => array(
             'schema' => array(
                 'type'  => 'array',
                 'items' => array( 'type' => 'string' ),
             ),
         ),
+        'sanitize_callback' => function( $value ) {
+            if ( ! is_array( $value ) ) {
+                return array();
+            }
+            return array_values( array_filter( array_map( 'esc_url_raw', $value ) ) );
+        },
     ));
 
     register_setting( 'sfse_settings', 'sfse_rejection_retention_days', array(
