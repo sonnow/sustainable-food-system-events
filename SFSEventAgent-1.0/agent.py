@@ -70,8 +70,8 @@ MAX_EVENTS_PER_CALL         = 1     # one event per call — eliminates cross-co
 SOURCE_MIN_RUNS             = 3     # minimum runs before a source can be deprioritised
 SOURCE_LOW_QUALITY_RATE     = 0.75  # deprioritise if rejection rate exceeds this
 SOURCE_FRESHNESS_DAYS       = 14    # skip sources checked successfully within this many days
-API_CALL_DELAY              = 65    # seconds between API calls (token budget reset)
-API_CALL_DELAY_LARGE        = 180   # after large responses — observed 120s caused consistent 429s
+API_CALL_DELAY              = 90    # seconds between API calls (token budget reset)
+API_CALL_DELAY_LARGE        = 240   # after large responses — observed 180s still caused 429s
 API_CALL_DELAY_AFTER_429    = 180   # after a rate-limit failure — same budget reset time as large responses
 
 # Deep search (pass 2) limits
@@ -594,6 +594,9 @@ def _search_and_extract_inner(query: str, system_prompt: str):
             block.text for block in response.content if hasattr(block, "text")
         ).strip()
 
+        # Strip markdown code fences — Claude sometimes wraps JSON in ```json ... ```
+        text = re.sub(r'```(?:json)?\s*', '', text).strip()
+
         # Extract JSON array
         start = text.find("[")
         end   = text.rfind("]") + 1
@@ -601,6 +604,7 @@ def _search_and_extract_inner(query: str, system_prompt: str):
             log.warning("  ⚠️  No JSON array in response.")
             return []
 
+        # Truncate anything after the closing ] (e.g. "**Note:** I can only return 1 event")
         raw_json = text[start:end]
 
         # Attempt 1: parse as-is
@@ -884,6 +888,7 @@ def normalise_event(event: dict) -> Optional[dict]:
     """
     # Must have title and start date
     if not event.get("title") or not event.get("date_start"):
+        log.warning(f"  ⚠️  Dropped (missing title or date_start): title={repr(event.get('title'))}, date_start={repr(event.get('date_start'))}")
         return None
 
     # Must be within search window
@@ -891,8 +896,10 @@ def normalise_event(event: dict) -> Optional[dict]:
         start = datetime.strptime(event["date_start"][:10], "%Y-%m-%d")
         end_window = TODAY + timedelta(days=365)
         if start < TODAY or start > end_window:
+            log.warning(f"  ⚠️  Dropped (date out of window): {event.get('title')} — {event['date_start']}")
             return None
     except ValueError:
+        log.warning(f"  ⚠️  Dropped (unparseable date_start): {event.get('title')} — {repr(event.get('date_start'))}")
         return None
 
     # Normalise datetime defaults
