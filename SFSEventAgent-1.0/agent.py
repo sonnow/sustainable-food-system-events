@@ -75,7 +75,11 @@ API_CALL_DELAY_LARGE        = 240   # after large responses — observed 180s st
 API_CALL_DELAY_AFTER_429    = 240   # after a rate-limit failure — same budget reset time as large responses
 
 # Deep search (pass 2) limits
-DEEP_SEARCH_MAX_QUERIES     = 8     # hard cap on pass 2 API calls per run — tune up after first production run
+DEEP_SEARCH_MAX_QUERIES     = 4     # hard cap on pass 2 API calls per run — reduced to save budget for discovery
+
+# Update policy — when False, existing events are never updated by the agent.
+# Saves API calls and prevents overwriting manual edits. Recommended: False.
+ENABLE_UPDATES              = False
 
 # Image fetch settings
 IMAGE_FETCH_TIMEOUT  = 8            # seconds — don't hang on slow event sites
@@ -447,7 +451,7 @@ def load_rejection_examples() -> list[dict]:
 
 # ─── Prompt builder ─────────────────────────────────────────────────────────────
 
-def build_system_prompt(rejection_examples: list[dict]) -> str:
+def build_system_prompt(rejection_examples: list[dict], known_links: set = None) -> str:
     base = f"""You are an event research assistant for sustainable food systems.
 
 TASK: Find events related to BOTH sustainability AND food. Both criteria must be met.
@@ -460,8 +464,8 @@ LANGUAGE: Do NOT translate. Keep all text in original language. source_language 
 OUTPUT: Valid JSON array only. No markdown, no explanation.
 LIMIT: Max {MAX_EVENTS_PER_CALL} events per response.
 
-Each event object (use null if unknown):
-{{"title":string,"date_start":"YYYY-MM-DD HH:MM","date_end":"YYYY-MM-DD HH:MM","description":"3-5 sentences in original language. Cover: (1) what the event is about, (2) who it is aimed at, (3) what format or activities to expect, (4) what makes it worth attending. Do NOT just restate the title. Do NOT begin with This event is about.","organiser":string,"event_type":"conference|festival|workshop|webinar|summit|community_event|other","topics":["agroecology|food_sovereignty|circular_economy|regenerative_agri|food_policy|nutrition|consumer_behaviour|other"],"event_languages":["ISO-639-1"],"source_language":"ISO-639-1","location_name":string,"city":string,"country":"ISO-3166-1-alpha-2 or ONLINE","format":"in-person|online|hybrid","cost":string,"registration_deadline":"YYYY-MM-DD HH:MM","event_link":string,"source_url":string}}
+Each event object (use null if unknown, EXCEPT event_link which is REQUIRED):
+{{"title":string,"date_start":"YYYY-MM-DD HH:MM","date_end":"YYYY-MM-DD HH:MM","description":"3-5 sentences in original language. Cover: (1) what the event is about, (2) who it is aimed at, (3) what format or activities to expect, (4) what makes it worth attending. Do NOT just restate the title. Do NOT begin with This event is about.","organiser":string,"event_type":"conference|festival|workshop|webinar|summit|community_event|other","topics":["agroecology|food_sovereignty|circular_economy|regenerative_agri|food_policy|nutrition|consumer_behaviour|other"],"event_languages":["ISO-639-1"],"source_language":"ISO-639-1","location_name":string,"city":string,"country":"ISO-3166-1-alpha-2 or ONLINE","format":"in-person|online|hybrid","cost":string,"registration_deadline":"YYYY-MM-DD HH:MM","event_link":string (REQUIRED — see rules below),"source_url":string}}
 
 TITLE RULES — critical, read carefully:
 - Use the official name exactly as the organiser uses it on their own website.
@@ -471,10 +475,12 @@ TITLE RULES — critical, read carefully:
 - Never mix the title of one event with the description or content of another. Each JSON object must describe one single coherent event — title, description, organiser, date, and event_link must all refer to the same event.
 
 EVENT_LINK RULES — critical, read carefully:
+- event_link is REQUIRED. Every event you found online has a URL — extract it.
 - event_link must be the URL of the organiser's own event page, not the listing or aggregator page where you found it.
 - source_url is where you found the event (the listing/aggregator page). event_link is where the event actually lives.
 - If you only have a listing page URL, search for the event by name to find the organiser's own URL and use that as event_link.
 - Never set event_link to the same domain as source_url unless the organiser genuinely hosts their events on that platform (e.g. Eventbrite, Meetup).
+- If you truly cannot find any URL for the event after searching, do NOT include that event in your response. Skip it entirely.
 
 CROSS-CONTAMINATION RULE — critical:
 - Each JSON object must be internally consistent. The title, description, organiser, date, location, event_link, and source_url must all refer to the exact same single event.
@@ -495,6 +501,16 @@ COST RULES — critical, read carefully:
             base += (
                 f"- \"{ex['title']}\" ({ex['rejection_reason']})\n"
             )
+
+    # Inject known event URLs so the model skips them during search
+    if known_links:
+        # Cap at 200 URLs to avoid blowing up prompt token budget
+        sample = sorted(known_links)[:200]
+        base += "\n\nALREADY KNOWN — skip any event whose URL matches one of these (do NOT return it):\n"
+        for link in sample:
+            base += f"- {link}\n"
+        if len(known_links) > 200:
+            base += f"(... and {len(known_links) - 200} more — if an event looks familiar, it is probably already tracked.)\n"
 
     return base.strip()
 
@@ -696,6 +712,46 @@ def fetch_event_image_url(event_url: str) -> Optional[str]:
 
         html = partial.decode("utf-8", errors="replace")
 
+        # ── Layer 0: JSON-LD structured data (@type: Event → image) ──────
+        # Many event platforms (Eventbrite, Meetup, university sites) embed
+        # structured data with a high-quality event image. Parsed from the
+        # same HTML — zero extra HTTP cost.
+        for ld_match in re.finditer(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.IGNORECASE | re.DOTALL
+        ):
+            try:
+                ld_data = json.loads(ld_match.group(1).strip())
+                # Handle both single objects and arrays
+                items = ld_data if isinstance(ld_data, list) else [ld_data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("@type", "")
+                    # Match Event or subtype like BusinessEvent, SocialEvent
+                    if "Event" not in str(item_type):
+                        continue
+                    img_val = item.get("image")
+                    if not img_val:
+                        continue
+                    # image can be a string URL, an object with url, or an array
+                    if isinstance(img_val, str):
+                        img = img_val
+                    elif isinstance(img_val, dict):
+                        img = img_val.get("url", "")
+                    elif isinstance(img_val, list) and img_val:
+                        first = img_val[0]
+                        img = first.get("url", first) if isinstance(first, dict) else str(first)
+                    else:
+                        continue
+                    if img:
+                        img = _make_absolute(img.strip(), event_url)
+                        if not _is_logo_url(img, alt="") and _is_valid_image_url(img):
+                            log.debug(f"  🖼  Layer 0 (JSON-LD): {img[:80]}")
+                            return img
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+
         # ── Layer 1: og:image / twitter:image ────────────────────────────────
         for pattern in (
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -882,9 +938,13 @@ def normalise_event(event: dict) -> Optional[dict]:
     Validate and clean a raw event dict.
     Returns None if the event should be discarded.
     """
-    # Must have title and start date
+    # Must have title, start date, and event_link
     if not event.get("title") or not event.get("date_start"):
         log.warning(f"  ⚠️  Dropped (missing title or date_start): title={repr(event.get('title'))}, date_start={repr(event.get('date_start'))}")
+        return None
+
+    if not event.get("event_link"):
+        log.warning(f"  ⚠️  Dropped (missing event_link): {event.get('title', '?')}")
         return None
 
     # Must be within search window
@@ -947,81 +1007,31 @@ def wp_auth():
     return (WP_USERNAME, WP_APP_PASSWORD)
 
 
-def wp_get_existing_event(title: str, date_start: str, event_link: str = '',
-                          organiser: str = '', city: str = '') -> Optional[dict]:
+def wp_get_existing_event(event_link: str) -> Optional[dict]:
     """
-    Check WordPress for an existing event.
+    Check WordPress for an existing event by canonical event_link URL.
 
-    Three checks in order:
-      1. event_link URL match (canonical form — most reliable)
-      2. title + date_start exact match (fallback for events without a link)
-      3. organiser + date_start + city match (catches same event found via
-         two different URLs with different titles)
+    event_link is mandatory on all events, so this is the only match
+    strategy needed. No fuzzy matching — exact canonical URL or nothing.
 
     Returns the WP post dict or None.
     """
     canonical_link = canonicalise_url(event_link) if event_link else ""
+    if not canonical_link:
+        return None
 
     try:
-        # ── 1. Match by canonical event_link ─────────────────────────────────
-        if canonical_link:
-            r = requests.get(
-                f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
-                params={"meta_key": "sfse_event_link", "meta_value": canonical_link, "per_page": 2},
-                auth=wp_auth(),
-                timeout=10,
-            )
-            if r.status_code == 200:
-                posts = r.json()
-                if posts:
-                    log.info(f"  🔗 Matched by event_link: {posts[0].get('id')} ← {canonical_link[:80]}")
-                    return posts[0]
-            # Incoming event has a URL but no WP post matched it — treat as new.
-            # Do NOT fall through to fuzzy matching: a known URL that doesn't
-            # match any existing post should create a new post, never overwrite
-            # a different event that happens to share a title or organiser.
-            return None
-
-        # ── 2. Match by title + date (only when event has no event_link) ──────
         r = requests.get(
             f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
-            params={"search": title[:50], "per_page": 5},
+            params={"meta_key": "sfse_event_link", "meta_value": canonical_link, "per_page": 2},
             auth=wp_auth(),
             timeout=10,
         )
         if r.status_code == 200:
             posts = r.json()
-            date_prefix = date_start[:10]
-            for post in posts:
-                existing_title = post.get("title", {}).get("rendered", "").strip()
-                existing_start = post.get("meta", {}).get("sfse_date_start", "")[:10]
-                if (
-                    existing_title.lower() == title.lower().strip()
-                    and existing_start == date_prefix
-                ):
-                    log.info(f"  🔗 Matched by title+date: {post.get('id')} ← '{title[:60]}'")
-                    return post
-
-        # ── 3. Match by organiser + date + city (only when event has no event_link) ──
-        if organiser and date_start and city:
-            r = requests.get(
-                f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
-                params={"meta_key": "sfse_organiser", "meta_value": organiser, "per_page": 10},
-                auth=wp_auth(),
-                timeout=10,
-            )
-            if r.status_code == 200:
-                posts = r.json()
-                date_prefix = date_start[:10]
-                for post in posts:
-                    meta = post.get("meta", {})
-                    if (
-                        meta.get("sfse_date_start", "")[:10] == date_prefix
-                        and meta.get("sfse_city", "").lower() == city.lower().strip()
-                    ):
-                        log.info(f"  🔗 Matched by organiser+date+city: {post.get('id')} ← '{organiser[:40]}'")
-                        return post
-
+            if posts:
+                log.info(f"  🔗 Matched by event_link: {posts[0].get('id')} ← {canonical_link[:80]}")
+                return posts[0]
         return None
 
     except Exception as e:
@@ -1140,10 +1150,7 @@ def post_event(event: dict, seen_urls: set) -> str:
                appears in both a known source and a discovery search.
     """
     title      = event.get("title", "")
-    date_start = event.get("date_start", "")
     event_link = event.get("event_link", "")
-    organiser  = event.get("organiser", "")
-    city       = event.get("city", "")
 
     # Within-run dedup — canonical URL already processed this session
     canonical = canonicalise_url(event_link) if event_link else ""
@@ -1153,11 +1160,22 @@ def post_event(event: dict, seen_urls: set) -> str:
     if canonical:
         seen_urls.add(canonical)
 
-    # Check for existing post in WordPress
-    existing = wp_get_existing_event(title, date_start, event_link, organiser, city)
+    # Check for existing post in WordPress (URL-only match)
+    existing = wp_get_existing_event(event_link)
 
     if existing:
+        # Updates disabled — skip all existing posts
+        if not ENABLE_UPDATES:
+            log.info(f"  ⏭️  Updates disabled — skipping existing: {title}")
+            return "unchanged"
+
         existing_meta = existing.get("meta", {})
+
+        # Verified posts are never overwritten
+        if existing_meta.get("sfse_verified"):
+            log.info(f"  🔒 Verified post — skipping update: {title}")
+            return "unchanged"
+
         update_payload = build_wp_update_payload(event, existing_meta)
         if update_payload is None:
             log.info(f"  ↔️  Unchanged: {title}")
@@ -1204,23 +1222,28 @@ def adaptive_delay(event_count: int):
     """
     Wait before the next API call.
 
-    Delay selection:
-      - After a 429 rate-limit failure : API_CALL_DELAY_AFTER_429 (4 min)
-        The SDK already retried 3× internally (~40s total). We add 4 more
-        minutes so the token-per-minute budget fully resets.
-      - After a large response (≥3 events) : API_CALL_DELAY_LARGE (4 min)
-        Large responses consume most of the TPM budget.
-      - Otherwise                          : API_CALL_DELAY (90s)
+    Uses exponential backoff for consecutive 429s. Resets on success.
+    Base delays:
+      - After a 429        : API_CALL_DELAY_AFTER_429 × 2^(consecutive - 1), cap 4×
+      - After a large resp  : API_CALL_DELAY_LARGE (4 min)
+      - Otherwise           : API_CALL_DELAY (90s)
     """
     if search_and_extract.last_was_rate_limited:
-        delay = API_CALL_DELAY_AFTER_429
-        search_and_extract.last_was_rate_limited = False  # reset after use
+        adaptive_delay._consecutive_429s += 1
+        multiplier = min(2 ** (adaptive_delay._consecutive_429s - 1), 4)  # cap at 4×
+        delay = int(API_CALL_DELAY_AFTER_429 * multiplier)
+        log.info(f"  ⚠️  Consecutive 429 #{adaptive_delay._consecutive_429s} — backoff {delay}s")
+        search_and_extract.last_was_rate_limited = False
     elif search_and_extract.last_was_large or event_count >= 5:
         delay = API_CALL_DELAY_LARGE
+        adaptive_delay._consecutive_429s = 0
     else:
         delay = API_CALL_DELAY
+        adaptive_delay._consecutive_429s = 0
     log.info(f"  ⏳ Waiting {delay}s before next API call...")
     time.sleep(delay)
+
+adaptive_delay._consecutive_429s = 0
 
 
 # ─── WordPress options reader ───────────────────────────────────────────────────
@@ -1486,16 +1509,16 @@ def backfill_missing_images(max_events: int = 20) -> None:
 
 def fetch_wp_known_event_links() -> set:
     """
-    Fetch all sfse_event_link values from published WordPress events.
+    Fetch all sfse_event_link values from WordPress events (any status).
 
-    Used to filter pass-1 candidates before pass-2 deep search, so we only
-    fan out from genuinely new events and don't waste API calls on events
-    already in WordPress.
+    Also includes URLs of posts where sfse_verified = true, so that
+    admin-curated posts are never rediscovered or overwritten.
 
     Returns a set of canonicalised URLs. Empty set on any failure (safe —
     dedup falls back to the per-event WP check in post_event()).
     """
     known: set = set()
+    verified_count = 0
     page = 1
     try:
         while True:
@@ -1519,16 +1542,19 @@ def fetch_wp_known_event_links() -> set:
             if not posts:
                 break
             for post in posts:
-                link = post.get("meta", {}).get("sfse_event_link", "")
+                meta = post.get("meta", {})
+                link = meta.get("sfse_event_link", "")
                 if link:
                     known.add(canonicalise_url(link))
+                if meta.get("sfse_verified") and link:
+                    verified_count += 1
             if len(posts) < 100:
                 break
             page += 1
     except Exception as e:
         log.warning(f"  ⚠️  Could not fetch known event links: {e}")
 
-    log.info(f"   Known event links loaded: {len(known)}")
+    log.info(f"   Known event links loaded: {len(known)} ({verified_count} verified)")
     return known
 
 
@@ -1684,14 +1710,14 @@ def run_agent():
     # ── 0. Backfill images onto existing events that have none ──────────────
     backfill_missing_images(max_events=20)
 
-    # ── 1. Load rejection feedback + known event links from WordPress ────────
+    # ── 1. Load known event links + rejection feedback from WordPress ────────
+    log.info("\n🗂  Loading known event links from WordPress...")
+    known_links = fetch_wp_known_event_links()
+
     log.info("\n📋 Loading rejection feedback from WordPress...")
     rejection_examples = load_rejection_examples()
     log.info(f"   {len(rejection_examples)} rejection examples loaded")
-    system_prompt = build_system_prompt(rejection_examples)
-
-    log.info("\n🗂  Loading known event links from WordPress...")
-    known_links = fetch_wp_known_event_links()
+    system_prompt = build_system_prompt(rejection_examples, known_links)
 
     # ── 2. Process manual event URLs from WP settings ───────────────────────
     manual_urls = fetch_wp_manual_urls()
