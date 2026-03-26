@@ -1015,6 +1015,9 @@ def wp_get_existing_event(event_link: str, known_links: dict) -> Optional[dict]:
     the WP REST API. This avoids the WP REST API meta_value query bug where
     any meta_key match returns arbitrary posts regardless of meta_value.
 
+    Entries with id=None are pass-1 dedup markers (events found this run
+    but not yet posted) — these are NOT existing WP posts and are ignored.
+
     Returns {"id": post_id, "meta": {...}} or None.
     """
     canonical_link = canonicalise_url(event_link) if event_link else ""
@@ -1022,9 +1025,10 @@ def wp_get_existing_event(event_link: str, known_links: dict) -> Optional[dict]:
         return None
 
     existing = known_links.get(canonical_link)
-    if existing:
+    if existing and existing.get("id") is not None:
         log.info(f"  🔗 Matched by event_link: {existing['id']} ← {canonical_link[:80]}")
-    return existing
+        return existing
+    return None
 
 
 def build_wp_payload(event: dict, status: str = "publish") -> dict:
