@@ -70,9 +70,9 @@ MAX_EVENTS_PER_CALL         = 1     # one event per call — eliminates cross-co
 SOURCE_MIN_RUNS             = 3     # minimum runs before a source can be deprioritised
 SOURCE_LOW_QUALITY_RATE     = 0.75  # deprioritise if rejection rate exceeds this
 SOURCE_FRESHNESS_DAYS       = 14    # skip sources checked successfully within this many days
-API_CALL_DELAY              = 65    # seconds between API calls (token budget reset)
-API_CALL_DELAY_LARGE        = 180   # after large responses — observed 120s caused consistent 429s
-API_CALL_DELAY_AFTER_429    = 180   # after a rate-limit failure — same budget reset time as large responses
+API_CALL_DELAY              = 90    # seconds between API calls (token budget reset)
+API_CALL_DELAY_LARGE        = 240   # after large responses — observed 180s still caused 429s
+API_CALL_DELAY_AFTER_429    = 240   # after a rate-limit failure — same budget reset time as large responses
 
 # Deep search (pass 2) limits
 DEEP_SEARCH_MAX_QUERIES     = 8     # hard cap on pass 2 API calls per run — tune up after first production run
@@ -884,6 +884,7 @@ def normalise_event(event: dict) -> Optional[dict]:
     """
     # Must have title and start date
     if not event.get("title") or not event.get("date_start"):
+        log.warning(f"  ⚠️  Dropped (missing title or date_start): title={repr(event.get('title'))}, date_start={repr(event.get('date_start'))}")
         return None
 
     # Must be within search window
@@ -891,8 +892,10 @@ def normalise_event(event: dict) -> Optional[dict]:
         start = datetime.strptime(event["date_start"][:10], "%Y-%m-%d")
         end_window = TODAY + timedelta(days=365)
         if start < TODAY or start > end_window:
+            log.warning(f"  ⚠️  Dropped (date out of window): {event.get('title')} — {event['date_start']}")
             return None
     except ValueError:
+        log.warning(f"  ⚠️  Dropped (unparseable date_start): {event.get('title')} — {repr(event.get('date_start'))}")
         return None
 
     # Normalise datetime defaults
@@ -1202,12 +1205,12 @@ def adaptive_delay(event_count: int):
     Wait before the next API call.
 
     Delay selection:
-      - After a 429 rate-limit failure : API_CALL_DELAY_AFTER_429 (3 min)
-        The SDK already retried 3× internally (~40s total). We add 3 more
+      - After a 429 rate-limit failure : API_CALL_DELAY_AFTER_429 (4 min)
+        The SDK already retried 3× internally (~40s total). We add 4 more
         minutes so the token-per-minute budget fully resets.
-      - After a large response (≥3 events) : API_CALL_DELAY_LARGE (2 min)
+      - After a large response (≥3 events) : API_CALL_DELAY_LARGE (4 min)
         Large responses consume most of the TPM budget.
-      - Otherwise                          : API_CALL_DELAY (65s)
+      - Otherwise                          : API_CALL_DELAY (90s)
     """
     if search_and_extract.last_was_rate_limited:
         delay = API_CALL_DELAY_AFTER_429
