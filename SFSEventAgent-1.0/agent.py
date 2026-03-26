@@ -70,7 +70,7 @@ MAX_EVENTS_PER_CALL         = 1     # one event per call — eliminates cross-co
 SOURCE_MIN_RUNS             = 3     # minimum runs before a source can be deprioritised
 SOURCE_LOW_QUALITY_RATE     = 0.75  # deprioritise if rejection rate exceeds this
 SOURCE_FRESHNESS_DAYS       = 14    # skip sources checked successfully within this many days
-API_CALL_DELAY              = 90    # seconds between API calls (token budget reset)
+API_CALL_DELAY              = 120   # seconds between API calls (token budget reset — 90s caused frequent 429s)
 API_CALL_DELAY_LARGE        = 240   # after large responses — observed 180s still caused 429s
 API_CALL_DELAY_AFTER_429    = 240   # after a rate-limit failure — same budget reset time as large responses
 
@@ -451,7 +451,7 @@ def load_rejection_examples() -> list[dict]:
 
 # ─── Prompt builder ─────────────────────────────────────────────────────────────
 
-def build_system_prompt(rejection_examples: list[dict], known_links: set = None) -> str:
+def build_system_prompt(rejection_examples: list[dict], known_links: dict = None) -> str:
     base = f"""You are an event research assistant for sustainable food systems.
 
 TASK: Find events related to BOTH sustainability AND food. Both criteria must be met.
@@ -1007,36 +1007,24 @@ def wp_auth():
     return (WP_USERNAME, WP_APP_PASSWORD)
 
 
-def wp_get_existing_event(event_link: str) -> Optional[dict]:
+def wp_get_existing_event(event_link: str, known_links: dict) -> Optional[dict]:
     """
-    Check WordPress for an existing event by canonical event_link URL.
+    Check if an event already exists in WordPress by canonical event_link URL.
 
-    event_link is mandatory on all events, so this is the only match
-    strategy needed. No fuzzy matching — exact canonical URL or nothing.
+    Uses the in-memory known_links dict loaded at startup — does NOT call
+    the WP REST API. This avoids the WP REST API meta_value query bug where
+    any meta_key match returns arbitrary posts regardless of meta_value.
 
-    Returns the WP post dict or None.
+    Returns {"id": post_id, "meta": {...}} or None.
     """
     canonical_link = canonicalise_url(event_link) if event_link else ""
     if not canonical_link:
         return None
 
-    try:
-        r = requests.get(
-            f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
-            params={"meta_key": "sfse_event_link", "meta_value": canonical_link, "per_page": 2},
-            auth=wp_auth(),
-            timeout=10,
-        )
-        if r.status_code == 200:
-            posts = r.json()
-            if posts:
-                log.info(f"  🔗 Matched by event_link: {posts[0].get('id')} ← {canonical_link[:80]}")
-                return posts[0]
-        return None
-
-    except Exception as e:
-        log.warning(f"WP existence check failed: {e}")
-        return None
+    existing = known_links.get(canonical_link)
+    if existing:
+        log.info(f"  🔗 Matched by event_link: {existing['id']} ← {canonical_link[:80]}")
+    return existing
 
 
 def build_wp_payload(event: dict, status: str = "publish") -> dict:
@@ -1140,7 +1128,7 @@ def build_wp_update_payload(event: dict, existing_meta: dict) -> Optional[dict]:
     return payload
 
 
-def post_event(event: dict, seen_urls: set) -> str:
+def post_event(event: dict, seen_urls: set, known_links: dict) -> str:
     """
     Create or update a WordPress event post.
     Returns: 'created' | 'updated' | 'unchanged' | 'failed'
@@ -1148,6 +1136,8 @@ def post_event(event: dict, seen_urls: set) -> str:
     seen_urls: in-memory set of canonical event_link URLs already processed
                this run — prevents within-run duplicates when the same event
                appears in both a known source and a discovery search.
+    known_links: in-memory dict of {canonical_url: {"id", "meta"}} loaded
+                 at startup — used for existence checks instead of WP API.
     """
     title      = event.get("title", "")
     event_link = event.get("event_link", "")
@@ -1160,8 +1150,8 @@ def post_event(event: dict, seen_urls: set) -> str:
     if canonical:
         seen_urls.add(canonical)
 
-    # Check for existing post in WordPress (URL-only match)
-    existing = wp_get_existing_event(event_link)
+    # Check for existing post via in-memory lookup (no WP API call)
+    existing = wp_get_existing_event(event_link, known_links)
 
     if existing:
         # Updates disabled — skip all existing posts
@@ -1507,17 +1497,18 @@ def backfill_missing_images(max_events: int = 20) -> None:
 
 # ─── Known event links (Option C dedup) ────────────────────────────────────────
 
-def fetch_wp_known_event_links() -> set:
+def fetch_wp_known_event_links() -> dict:
     """
-    Fetch all sfse_event_link values from WordPress events (any status).
+    Fetch all sfse_event_link values from WordPress events (any status),
+    along with post ID and meta for each.
 
-    Also includes URLs of posts where sfse_verified = true, so that
-    admin-curated posts are never rediscovered or overwritten.
+    Returns a dict of {canonical_url: {"id": post_id, "meta": {...}}}.
+    Used for both dedup filtering (key existence) and in-memory event
+    lookup (replacing the broken WP REST API meta_value query).
 
-    Returns a set of canonicalised URLs. Empty set on any failure (safe —
-    dedup falls back to the per-event WP check in post_event()).
+    Also includes posts where sfse_verified = true.
     """
-    known: set = set()
+    known: dict = {}
     verified_count = 0
     page = 1
     try:
@@ -1528,7 +1519,7 @@ def fetch_wp_known_event_links() -> set:
                     "status":   "any",
                     "per_page": 100,
                     "page":     page,
-                    "_fields":  "meta",
+                    "_fields":  "id,meta",
                 },
                 auth=wp_auth(),
                 timeout=15,
@@ -1545,7 +1536,8 @@ def fetch_wp_known_event_links() -> set:
                 meta = post.get("meta", {})
                 link = meta.get("sfse_event_link", "")
                 if link:
-                    known.add(canonicalise_url(link))
+                    canonical = canonicalise_url(link)
+                    known[canonical] = {"id": post["id"], "meta": meta}
                 if meta.get("sfse_verified") and link:
                     verified_count += 1
             if len(posts) < 100:
@@ -1558,7 +1550,7 @@ def fetch_wp_known_event_links() -> set:
     return known
 
 
-def filter_known_events(events: list[dict], known_links: set) -> tuple[list[dict], int]:
+def filter_known_events(events: list[dict], known_links: dict) -> tuple[list[dict], int]:
     """
     Remove events whose canonical event_link is already in WordPress.
     Returns (new_events, skipped_count).
@@ -1576,7 +1568,7 @@ def filter_known_events(events: list[dict], known_links: set) -> tuple[list[dict
 
 # ─── Deep search pass 2 (Option E) ─────────────────────────────────────────────
 
-def build_deep_search_queries(new_events: list[dict], known_links: set) -> list[str]:
+def build_deep_search_queries(new_events: list[dict], known_links: dict) -> list[str]:
     """
     Generate targeted follow-up search queries from pass-1 discoveries.
 
@@ -1840,8 +1832,8 @@ def run_agent():
     # Add new pass-1 events to known_links so pass-2 seeds don't re-find them
     for event in new_from_pass1:
         link = canonicalise_url(event.get("event_link") or "")
-        if link:
-            known_links.add(link)
+        if link and link not in known_links:
+            known_links[link] = {"id": None, "meta": {}}
 
     # ── 7. Deep search pass 2 (Option E) ─────────────────────────────────────
     deep_queries = build_deep_search_queries(new_from_pass1, known_links)
@@ -1889,7 +1881,7 @@ def run_agent():
     seen_urls: set = set()   # within-run dedup by canonical event_link
 
     for event in all_new_events:
-        outcome = post_event(event, seen_urls)
+        outcome = post_event(event, seen_urls, known_links)
         results[outcome] += 1
 
         source_url = event.get("source_url", "discovery")
