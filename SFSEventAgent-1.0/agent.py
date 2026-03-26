@@ -1199,6 +1199,11 @@ def post_event(event: dict, seen_urls: set, known_links: dict) -> str:
             )
             if r.status_code in (200, 201):
                 log.info(f"  ✅ Created: {title}")
+                # Sideload image as featured image if available
+                new_post_id = r.json().get("id")
+                image_url = event.get("image_url")
+                if new_post_id and image_url:
+                    sideload_image_to_wp(image_url, new_post_id, title)
                 return "created"
             else:
                 log.error(f"  ❌ Create failed ({r.status_code}): {title} — {r.text[:150]}")
@@ -1347,6 +1352,94 @@ def _is_valid_image_url(url: str) -> bool:
         return False
 
 
+def sideload_image_to_wp(image_url: str, post_id: int, post_title: str) -> Optional[int]:
+    """
+    Download an image from image_url, upload it to the WordPress media
+    library, and attach it to post_id as the featured image.
+
+    Returns the attachment ID on success, None on any failure.
+    Never raises — all errors are logged and swallowed.
+
+    Steps:
+      1. GET the image bytes from the external URL
+      2. POST to /wp-json/wp/v2/media with the binary payload
+      3. PATCH the post to set featured_media to the new attachment ID
+    """
+    if not image_url or not post_id:
+        return None
+
+    try:
+        # ── 1. Download the image ────────────────────────────────────────────
+        dl = requests.get(
+            image_url,
+            headers={"User-Agent": IMAGE_FETCH_UA},
+            timeout=IMAGE_FETCH_TIMEOUT,
+            allow_redirects=True,
+        )
+        if dl.status_code != 200:
+            log.debug(f"  🖼  Sideload download failed ({dl.status_code}): {image_url[:80]}")
+            return None
+
+        content_type = dl.headers.get("Content-Type", "image/jpeg")
+        # Derive a filename from the URL path
+        url_path = urllib.parse.urlparse(image_url).path
+        filename = url_path.rsplit("/", 1)[-1] or "event-image.jpg"
+        # Sanitise filename — keep only alphanumeric, hyphens, dots
+        filename = re.sub(r'[^\w.\-]', '-', filename)[:80]
+        # Ensure it has an image extension
+        if not re.search(r'\.(jpe?g|png|gif|webp)$', filename, re.IGNORECASE):
+            ext = "jpg"
+            if "png" in content_type:
+                ext = "png"
+            elif "gif" in content_type:
+                ext = "gif"
+            elif "webp" in content_type:
+                ext = "webp"
+            filename = f"{filename}.{ext}"
+
+        # ── 2. Upload to WordPress media library ─────────────────────────────
+        upload_headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Type": content_type,
+        }
+        r = requests.post(
+            f"{WP_BASE_URL}/wp-json/wp/v2/media",
+            headers=upload_headers,
+            data=dl.content,
+            auth=wp_auth(),
+            timeout=30,
+        )
+        if r.status_code not in (200, 201):
+            log.warning(f"  ⚠️  Sideload upload failed ({r.status_code}): {r.text[:120]}")
+            return None
+
+        attachment_id = r.json().get("id")
+        if not attachment_id:
+            log.warning(f"  ⚠️  Sideload upload returned no attachment ID")
+            return None
+
+        # ── 3. Set as featured image on the post ─────────────────────────────
+        r2 = requests.post(
+            f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events/{post_id}",
+            json={"featured_media": attachment_id},
+            auth=wp_auth(),
+            timeout=15,
+        )
+        if r2.status_code in (200, 201):
+            log.info(f"  🖼  Featured image set on post {post_id}: {filename}")
+            return attachment_id
+        else:
+            log.warning(f"  ⚠️  Could not set featured image on post {post_id} ({r2.status_code})")
+            return attachment_id  # image uploaded but not linked — still useful
+
+    except requests.exceptions.Timeout:
+        log.debug(f"  🖼  Sideload timeout: {image_url[:80]}")
+        return None
+    except Exception as e:
+        log.debug(f"  🖼  Sideload error: {e}")
+        return None
+
+
 def backfill_missing_images(max_events: int = 20) -> None:
     """
     Two-pass image maintenance on existing published WP events:
@@ -1376,7 +1469,7 @@ def backfill_missing_images(max_events: int = 20) -> None:
                     "status":   "publish",
                     "per_page": 50,
                     "page":     page,
-                    "_fields":  "id,meta",
+                    "_fields":  "id,meta,featured_media",
                 },
                 auth=wp_auth(),
                 timeout=15,
@@ -1440,9 +1533,13 @@ def backfill_missing_images(max_events: int = 20) -> None:
     # ── Pass 2: backfill empty slots ──────────────────────────────────────────
     candidates = []
     for post in all_posts:
-        meta       = post.get("meta", {})
-        event_link = meta.get("sfse_event_link", "")
-        image_url  = meta.get("sfse_image_url", "")
+        meta           = post.get("meta", {})
+        event_link     = meta.get("sfse_event_link", "")
+        image_url      = meta.get("sfse_image_url", "")
+        featured_media = post.get("featured_media", 0)
+        # Skip if post already has a featured image
+        if featured_media:
+            continue
         # Include if: no image stored, OR image was just cleared in Pass 1
         already_cleared = any(
             b["id"] == post["id"] and b.get("_cleared")
@@ -1484,6 +1581,8 @@ def backfill_missing_images(max_events: int = 20) -> None:
             )
             if r.status_code in (200, 201):
                 log.info(f"  🖼  Backfilled post {post_id}: {img_url[:80]}")
+                # Also sideload as featured image if post doesn't have one
+                sideload_image_to_wp(img_url, post_id, f"post-{post_id}")
                 filled += 1
             else:
                 log.warning(f"  ⚠️  Backfill patch failed for post {post_id} ({r.status_code})")
