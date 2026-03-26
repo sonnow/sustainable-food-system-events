@@ -70,8 +70,8 @@ MAX_EVENTS_PER_CALL         = 1     # one event per call — eliminates cross-co
 SOURCE_MIN_RUNS             = 3     # minimum runs before a source can be deprioritised
 SOURCE_LOW_QUALITY_RATE     = 0.75  # deprioritise if rejection rate exceeds this
 SOURCE_FRESHNESS_DAYS       = 14    # skip sources checked successfully within this many days
-API_CALL_DELAY              = 90    # seconds between API calls (token budget reset)
-API_CALL_DELAY_LARGE        = 240   # after large responses — observed 180s still caused 429s
+API_CALL_DELAY              = 65    # seconds between API calls (token budget reset)
+API_CALL_DELAY_LARGE        = 180   # after large responses — observed 120s caused consistent 429s
 API_CALL_DELAY_AFTER_429    = 180   # after a rate-limit failure — same budget reset time as large responses
 
 # Deep search (pass 2) limits
@@ -594,9 +594,6 @@ def _search_and_extract_inner(query: str, system_prompt: str):
             block.text for block in response.content if hasattr(block, "text")
         ).strip()
 
-        # Strip markdown code fences — Claude sometimes wraps JSON in ```json ... ```
-        text = re.sub(r'```(?:json)?\s*', '', text).strip()
-
         # Extract JSON array
         start = text.find("[")
         end   = text.rfind("]") + 1
@@ -604,7 +601,6 @@ def _search_and_extract_inner(query: str, system_prompt: str):
             log.warning("  ⚠️  No JSON array in response.")
             return []
 
-        # Truncate anything after the closing ] (e.g. "**Note:** I can only return 1 event")
         raw_json = text[start:end]
 
         # Attempt 1: parse as-is
@@ -888,7 +884,6 @@ def normalise_event(event: dict) -> Optional[dict]:
     """
     # Must have title and start date
     if not event.get("title") or not event.get("date_start"):
-        log.warning(f"  ⚠️  Dropped (missing title or date_start): title={repr(event.get('title'))}, date_start={repr(event.get('date_start'))}")
         return None
 
     # Must be within search window
@@ -896,10 +891,8 @@ def normalise_event(event: dict) -> Optional[dict]:
         start = datetime.strptime(event["date_start"][:10], "%Y-%m-%d")
         end_window = TODAY + timedelta(days=365)
         if start < TODAY or start > end_window:
-            log.warning(f"  ⚠️  Dropped (date out of window): {event.get('title')} — {event['date_start']}")
             return None
     except ValueError:
-        log.warning(f"  ⚠️  Dropped (unparseable date_start): {event.get('title')} — {repr(event.get('date_start'))}")
         return None
 
     # Normalise datetime defaults
@@ -978,9 +971,15 @@ def wp_get_existing_event(title: str, date_start: str, event_link: str = '',
             if r.status_code == 200:
                 posts = r.json()
                 if posts:
+                    log.info(f"  🔗 Matched by event_link: {posts[0].get('id')} ← {canonical_link[:80]}")
                     return posts[0]
+            # Incoming event has a URL but no WP post matched it — treat as new.
+            # Do NOT fall through to fuzzy matching: a known URL that doesn't
+            # match any existing post should create a new post, never overwrite
+            # a different event that happens to share a title or organiser.
+            return None
 
-        # ── 2. Match by title + date ──────────────────────────────────────────
+        # ── 2. Match by title + date (only when event has no event_link) ──────
         r = requests.get(
             f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
             params={"search": title[:50], "per_page": 5},
@@ -997,9 +996,10 @@ def wp_get_existing_event(title: str, date_start: str, event_link: str = '',
                     existing_title.lower() == title.lower().strip()
                     and existing_start == date_prefix
                 ):
+                    log.info(f"  🔗 Matched by title+date: {post.get('id')} ← '{title[:60]}'")
                     return post
 
-        # ── 3. Match by organiser + date + city ───────────────────────────────
+        # ── 3. Match by organiser + date + city (only when event has no event_link) ──
         if organiser and date_start and city:
             r = requests.get(
                 f"{WP_BASE_URL}/wp-json/wp/v2/sustainable-food-events",
@@ -1016,7 +1016,7 @@ def wp_get_existing_event(title: str, date_start: str, event_link: str = '',
                         meta.get("sfse_date_start", "")[:10] == date_prefix
                         and meta.get("sfse_city", "").lower() == city.lower().strip()
                     ):
-                        log.info(f"  🔁 Dedup via organiser+date+city: {title}")
+                        log.info(f"  🔗 Matched by organiser+date+city: {post.get('id')} ← '{organiser[:40]}'")
                         return post
 
         return None
@@ -1154,7 +1154,7 @@ def post_event(event: dict, seen_urls: set) -> str:
     existing = wp_get_existing_event(title, date_start, event_link, organiser, city)
 
     if existing:
-        existing_meta  = existing.get("meta", {})
+        existing_meta = existing.get("meta", {})
         update_payload = build_wp_update_payload(event, existing_meta)
         if update_payload is None:
             log.info(f"  ↔️  Unchanged: {title}")
