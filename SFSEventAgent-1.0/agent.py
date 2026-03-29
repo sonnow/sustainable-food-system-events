@@ -23,6 +23,7 @@ import re
 import time
 import logging
 import urllib.parse
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dotenv import load_dotenv
@@ -55,8 +56,9 @@ WP_BASE_URL       = os.getenv("WP_BASE_URL", "").rstrip("/")
 WP_USERNAME       = os.getenv("WP_USERNAME")
 WP_APP_PASSWORD   = os.getenv("WP_APP_PASSWORD")
 
-# Model — Haiku for cost efficiency; Sonnet reserved for future ambiguous relevance escalation
-EXTRACTION_MODEL = "claude-haiku-4-5-20251001"
+# Model — Haiku for cost efficiency; Sonnet for known sources that Haiku fails on
+EXTRACTION_MODEL   = "claude-haiku-4-5-20251001"
+ESCALATION_MODEL   = "claude-sonnet-4-20250514"
 
 # Search window
 TODAY           = datetime.today()
@@ -73,9 +75,10 @@ SOURCE_FRESHNESS_DAYS       = 14    # skip sources checked successfully within t
 API_CALL_DELAY              = 120   # seconds between API calls (token budget reset — 90s caused frequent 429s)
 API_CALL_DELAY_LARGE        = 240   # after large responses — observed 180s still caused 429s
 API_CALL_DELAY_AFTER_429    = 240   # after a rate-limit failure — same budget reset time as large responses
+TITLE_SIMILARITY_THRESHOLD  = 0.85  # skip event if title is ≥85% similar to an already-processed event with same date
 
 # Deep search (pass 2) limits
-DEEP_SEARCH_MAX_QUERIES     = 4     # hard cap on pass 2 API calls per run — reduced to save budget for discovery
+DEEP_SEARCH_MAX_QUERIES     = 2     # hard cap on pass 2 API calls per run — reduced to save budget for discovery
 
 # Update policy — when False, existing events are never updated by the agent.
 # Saves API calls and prevents overwriting manual edits. Recommended: False.
@@ -567,14 +570,15 @@ def clean_json_string(text: str) -> str:
 
 # ─── Event extraction via Claude ────────────────────────────────────────────────
 
-def search_and_extract(query: str, system_prompt: str) -> list[dict]:
+def search_and_extract(query: str, system_prompt: str, model: str = None) -> list[dict]:
     """
     Send a search query to Claude and return structured event list.
     Returns [] on any failure. Sets flags on the function object so
     adaptive_delay() can choose the right wait time.
     """
+    use_model = model or EXTRACTION_MODEL
     log.info(f"  🔍 {query[:100]}...")
-    result = _search_and_extract_inner(query, system_prompt)
+    result = _search_and_extract_inner(query, system_prompt, use_model)
     if result == "rate_limited":
         search_and_extract.last_was_rate_limited = True
         search_and_extract.last_was_large = False
@@ -595,11 +599,12 @@ search_and_extract.last_was_large = False
 search_and_extract.last_was_rate_limited = False
 
 
-def _search_and_extract_inner(query: str, system_prompt: str):
+def _search_and_extract_inner(query: str, system_prompt: str, model: str = None):
     """Inner extraction — returns list, 'large_failure', or 'failure'."""
+    use_model = model or EXTRACTION_MODEL
     try:
         response = client.messages.create(
-            model=EXTRACTION_MODEL,
+            model=use_model,
             max_tokens=MAX_TOKENS_PER_CALL,
             system=system_prompt,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
@@ -1132,7 +1137,7 @@ def build_wp_update_payload(event: dict, existing_meta: dict) -> Optional[dict]:
     return payload
 
 
-def post_event(event: dict, seen_urls: set, known_links: dict) -> str:
+def post_event(event: dict, seen_urls: set, known_links: dict, seen_titles: list) -> str:
     """
     Create or update a WordPress event post.
     Returns: 'created' | 'updated' | 'unchanged' | 'failed'
@@ -1142,9 +1147,12 @@ def post_event(event: dict, seen_urls: set, known_links: dict) -> str:
                appears in both a known source and a discovery search.
     known_links: in-memory dict of {canonical_url: {"id", "meta"}} loaded
                  at startup — used for existence checks instead of WP API.
+    seen_titles: list of (title, date_start[:10]) tuples already processed
+                 this run — catches near-duplicate titles with the same date.
     """
     title      = event.get("title", "")
     event_link = event.get("event_link", "")
+    date_start = event.get("date_start", "")[:10]
 
     # Within-run dedup — canonical URL already processed this session
     canonical = canonicalise_url(event_link) if event_link else ""
@@ -1153,6 +1161,16 @@ def post_event(event: dict, seen_urls: set, known_links: dict) -> str:
         return "unchanged"
     if canonical:
         seen_urls.add(canonical)
+
+    # Title similarity dedup — catches same event with slightly different
+    # titles or URL variants (e.g. "Summit 2026" vs "Summit")
+    for seen_title, seen_date in seen_titles:
+        if seen_date == date_start:
+            ratio = SequenceMatcher(None, title.lower(), seen_title.lower()).ratio()
+            if ratio >= TITLE_SIMILARITY_THRESHOLD:
+                log.info(f"  ⏭️  Similar title (skipped, {ratio:.0%} match): '{title}' ≈ '{seen_title}'")
+                return "unchanged"
+    seen_titles.append((title, date_start))
 
     # Check for existing post via in-memory lookup (no WP API call)
     existing = wp_get_existing_event(event_link, known_links)
@@ -1622,7 +1640,7 @@ def fetch_wp_known_event_links() -> dict:
                     "status":   "any",
                     "per_page": 100,
                     "page":     page,
-                    "_fields":  "id,meta",
+                    "_fields":  "id,title,meta",
                 },
                 auth=wp_auth(),
                 timeout=15,
@@ -1638,9 +1656,10 @@ def fetch_wp_known_event_links() -> dict:
             for post in posts:
                 meta = post.get("meta", {})
                 link = meta.get("sfse_event_link", "")
+                post_title = post.get("title", {}).get("rendered", "")
                 if link:
                     canonical = canonicalise_url(link)
-                    known[canonical] = {"id": post["id"], "meta": meta}
+                    known[canonical] = {"id": post["id"], "meta": meta, "title": post_title}
                 if meta.get("sfse_verified") and link:
                     verified_count += 1
             if len(posts) < 100:
@@ -1890,6 +1909,14 @@ def run_agent():
             f"Only set event_link to null if no URL can be found after searching."
         )
         events = search_and_extract(query, system_prompt)
+
+        # Escalate to Sonnet if Haiku returned nothing — known sources are
+        # high-value and worth the extra cost to avoid missing events.
+        if not events:
+            log.info(f"  🔄 Haiku returned nothing — escalating to Sonnet for: {source_url}")
+            adaptive_delay(0)
+            events = search_and_extract(query, system_prompt, model=ESCALATION_MODEL)
+
         all_events.extend(events)
         record_source_outcome(source_url, source_scores, published=0, rejected=0)
         adaptive_delay(len(events))
@@ -1981,10 +2008,19 @@ def run_agent():
     # ── 10. Post to WordPress ─────────────────────────────────────────────────
     log.info(f"\n🚀 Posting to WordPress...")
     results  = {"created": 0, "updated": 0, "unchanged": 0, "failed": 0}
-    seen_urls: set = set()   # within-run dedup by canonical event_link
+    seen_urls: set = set()      # within-run dedup by canonical event_link
+    seen_titles: list = []      # within-run dedup by title similarity + date
+
+    # Seed with existing WP event titles so similarity check catches cross-run dupes
+    for entry in known_links.values():
+        if entry.get("id") is not None:
+            t = entry.get("title", "")
+            d = entry.get("meta", {}).get("sfse_date_start", "")[:10]
+            if t and d:
+                seen_titles.append((t, d))
 
     for event in all_new_events:
-        outcome = post_event(event, seen_urls, known_links)
+        outcome = post_event(event, seen_urls, known_links, seen_titles)
         results[outcome] += 1
 
         source_url = event.get("source_url", "discovery")
