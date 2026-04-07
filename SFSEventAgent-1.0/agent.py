@@ -574,7 +574,7 @@ def search_and_extract(query: str, system_prompt: str, model: str = None) -> lis
     """
     Send a search query to Claude and return structured event list.
     Returns [] on any failure. Sets flags on the function object so
-    adaptive_delay() can choose the right wait time.
+    adaptive_delay() and escalation logic can choose the right action.
     """
     use_model = model or EXTRACTION_MODEL
     log.info(f"  🔍 {query[:100]}...")
@@ -582,21 +582,26 @@ def search_and_extract(query: str, system_prompt: str, model: str = None) -> lis
     if result == "rate_limited":
         search_and_extract.last_was_rate_limited = True
         search_and_extract.last_was_large = False
+        search_and_extract.last_was_json_failure = False
         return []
     if result == "large_failure":
         search_and_extract.last_was_rate_limited = False
         search_and_extract.last_was_large = True
+        search_and_extract.last_was_json_failure = True
         return []
     if result == "failure":
         search_and_extract.last_was_rate_limited = False
         search_and_extract.last_was_large = False
+        search_and_extract.last_was_json_failure = True
         return []
     search_and_extract.last_was_rate_limited = False
     search_and_extract.last_was_large = len(result) >= 3
+    search_and_extract.last_was_json_failure = False
     return result
 
 search_and_extract.last_was_large = False
 search_and_extract.last_was_rate_limited = False
+search_and_extract.last_was_json_failure = False
 
 
 def _search_and_extract_inner(query: str, system_prompt: str, model: str = None):
@@ -620,7 +625,7 @@ def _search_and_extract_inner(query: str, system_prompt: str, model: str = None)
         end   = text.rfind("]") + 1
         if start == -1 or end == 0:
             log.warning("  ⚠️  No JSON array in response.")
-            return []
+            return "failure"
 
         raw_json = text[start:end]
 
@@ -1831,7 +1836,12 @@ def run_agent():
     log.info("\n📋 Loading rejection feedback from WordPress...")
     rejection_examples = load_rejection_examples()
     log.info(f"   {len(rejection_examples)} rejection examples loaded")
-    system_prompt = build_system_prompt(rejection_examples, known_links)
+
+    # Two prompt variants to control input token cost:
+    # - system_prompt_discovery: includes known links (for regional discovery + deep search)
+    # - system_prompt_extract:   no known links (for known sources + manual URLs)
+    system_prompt_discovery = build_system_prompt(rejection_examples, known_links)
+    system_prompt_extract   = build_system_prompt(rejection_examples)
 
     # ── 2. Process manual event URLs from WP settings ───────────────────────
     manual_urls = fetch_wp_manual_urls()
@@ -1848,7 +1858,7 @@ def run_agent():
                 f"to BOTH sustainability AND food systems, still return it but set "
                 f"a field 'manual_rejected' to true and 'rejection_reason' to a brief explanation."
             )
-            events = search_and_extract(query, system_prompt)
+            events = search_and_extract(query, system_prompt_extract)
             for event in events:
                 event["_manual"] = True
                 event["_source_url"] = url
@@ -1908,14 +1918,14 @@ def run_agent():
             f"by name to find the organiser's own website URL and use that as event_link. "
             f"Only set event_link to null if no URL can be found after searching."
         )
-        events = search_and_extract(query, system_prompt)
+        events = search_and_extract(query, system_prompt_extract)
 
-        # Escalate to Sonnet if Haiku returned nothing — known sources are
-        # high-value and worth the extra cost to avoid missing events.
-        if not events:
-            log.info(f"  🔄 Haiku returned nothing — escalating to Sonnet for: {source_url}")
+        # Escalate to Sonnet only if Haiku failed to return valid JSON —
+        # an empty array [] means "no events found" which is a valid response.
+        if not events and search_and_extract.last_was_json_failure:
+            log.info(f"  🔄 Haiku JSON failure — escalating to Sonnet for: {source_url}")
             adaptive_delay(0)
-            events = search_and_extract(query, system_prompt, model=ESCALATION_MODEL)
+            events = search_and_extract(query, system_prompt_extract, model=ESCALATION_MODEL)
 
         all_events.extend(events)
         record_source_outcome(source_url, source_scores, published=0, rejected=0)
@@ -1940,7 +1950,7 @@ def run_agent():
                 f"by name to find the organiser's own website URL and use that as event_link. "
                 f"Only set event_link to null if no URL can be found after searching."
             )
-            events = search_and_extract(query, system_prompt)
+            events = search_and_extract(query, system_prompt_discovery)
             all_events.extend(events)
             adaptive_delay(len(events))
 
@@ -1975,7 +1985,7 @@ def run_agent():
             if len(pass2_events) + len(new_from_pass1) >= MAX_CANDIDATES:
                 log.info(f"  🛑 Candidate limit reached — stopping deep search")
                 break
-            events = search_and_extract(query, system_prompt)
+            events = search_and_extract(query, system_prompt_discovery)
             pass2_events.extend(events)
             adaptive_delay(len(events))
 
