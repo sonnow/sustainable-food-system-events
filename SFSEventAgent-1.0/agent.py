@@ -58,7 +58,7 @@ WP_APP_PASSWORD   = os.getenv("WP_APP_PASSWORD")
 
 # Model — Haiku for cost efficiency; Sonnet for known sources that Haiku fails on
 EXTRACTION_MODEL   = "claude-haiku-4-5-20251001"
-ESCALATION_MODEL   = "claude-sonnet-4-20250514"
+ESCALATION_MODEL   = "claude-sonnet-4-6"
 
 # Search window
 TODAY           = datetime.today()
@@ -72,6 +72,7 @@ MAX_EVENTS_PER_CALL         = 1     # one event per call — eliminates cross-co
 SOURCE_MIN_RUNS             = 3     # minimum runs before a source can be deprioritised
 SOURCE_LOW_QUALITY_RATE     = 0.75  # deprioritise if rejection rate exceeds this
 SOURCE_FRESHNESS_DAYS       = 14    # skip sources checked successfully within this many days
+SOURCE_HAIKU_FAIL_THRESHOLD = 3     # after this many consecutive Haiku JSON failures, skip Haiku and use Sonnet directly
 API_CALL_DELAY              = 120   # seconds between API calls (token budget reset — 90s caused frequent 429s)
 API_CALL_DELAY_LARGE        = 240   # after large responses — observed 180s still caused 429s
 API_CALL_DELAY_AFTER_429    = 240   # after a rate-limit failure — same budget reset time as large responses
@@ -417,6 +418,27 @@ def record_source_outcome(url: str, scores: dict, published: int, rejected: int)
     scores[url]["published"]    += published
     scores[url]["rejected"]     += rejected
     scores[url]["last_checked"]  = TODAY.strftime("%Y-%m-%d")
+
+
+def is_source_sonnet_only(url: str, scores: dict) -> bool:
+    """Returns True if this source has failed on Haiku too many consecutive times."""
+    s = scores.get(url)
+    if not s:
+        return False
+    return s.get("haiku_consecutive_fails", 0) >= SOURCE_HAIKU_FAIL_THRESHOLD
+
+
+def record_haiku_failure(url: str, scores: dict):
+    """Increment the consecutive Haiku failure counter for a source."""
+    if url not in scores:
+        scores[url] = {"runs": 0, "published": 0, "rejected": 0, "last_checked": None}
+    scores[url]["haiku_consecutive_fails"] = scores[url].get("haiku_consecutive_fails", 0) + 1
+
+
+def record_haiku_success(url: str, scores: dict):
+    """Reset the consecutive Haiku failure counter on success."""
+    if url in scores:
+        scores[url]["haiku_consecutive_fails"] = 0
 
 
 # ─── Feedback loader ────────────────────────────────────────────────────────────
@@ -1890,7 +1912,32 @@ def run_agent():
 
         clear_wp_manual_urls()
 
-    # ── 3. Monitor known sources ─────────────────────────────────────────────
+    # ── 3. Discovery searches (pass 1) — prioritised over known sources ────
+    #    Discovery is where genuinely new events come from. If the budget
+    #    is tight, this must run before known sources consume it all.
+    if len(all_events) < MAX_CANDIDATES:
+        log.info(f"\n🌍 Running discovery searches across priority regions...")
+        for region_batch in REGION_BATCHES:
+
+            if len(all_events) >= MAX_CANDIDATES:
+                log.info(f"  🛑 Candidate limit reached — skipping remaining regions")
+                break
+
+            query = (
+                f"Find upcoming events in {region_batch} related to sustainable food systems, "
+                f"food sovereignty, agroecology, regenerative agriculture, food policy, "
+                f"circular food economy, or sustainable nutrition. "
+                f"Include conferences, workshops, festivals, webinars, summits, and community events. "
+                f"Only include events between {SEARCH_FROM} and {SEARCH_TO}. "
+                f"For each event found, if no direct event_link is available, search for the event "
+                f"by name to find the organiser's own website URL and use that as event_link. "
+                f"Only set event_link to null if no URL can be found after searching."
+            )
+            events = search_and_extract(query, system_prompt_discovery)
+            all_events.extend(events)
+            adaptive_delay(len(events))
+
+    # ── 4. Monitor known sources ─────────────────────────────────────────────
     known_sources = fetch_wp_known_sources()
     if not known_sources:
         log.warning("  ⚠️  No known sources in WP settings — check SFS Events > Settings")
@@ -1918,41 +1965,29 @@ def run_agent():
             f"by name to find the organiser's own website URL and use that as event_link. "
             f"Only set event_link to null if no URL can be found after searching."
         )
-        events = search_and_extract(query, system_prompt_extract)
 
-        # Escalate to Sonnet only if Haiku failed to return valid JSON —
-        # an empty array [] means "no events found" which is a valid response.
-        if not events and search_and_extract.last_was_json_failure:
-            log.info(f"  🔄 Haiku JSON failure — escalating to Sonnet for: {source_url}")
-            adaptive_delay(0)
+        # Sources that consistently fail on Haiku go straight to Sonnet
+        if is_source_sonnet_only(source_url, source_scores):
+            log.info(f"  🔀 Sonnet-only source (Haiku failed {SOURCE_HAIKU_FAIL_THRESHOLD}+ times): {source_url}")
             events = search_and_extract(query, system_prompt_extract, model=ESCALATION_MODEL)
+            if events:
+                record_haiku_success(source_url, source_scores)  # reset if Sonnet found events
+        else:
+            events = search_and_extract(query, system_prompt_extract)
+
+            # Escalate to Sonnet only if Haiku failed to return valid JSON —
+            # an empty array [] means "no events found" which is a valid response.
+            if not events and search_and_extract.last_was_json_failure:
+                record_haiku_failure(source_url, source_scores)
+                log.info(f"  🔄 Haiku JSON failure — escalating to Sonnet for: {source_url}")
+                adaptive_delay(0)
+                events = search_and_extract(query, system_prompt_extract, model=ESCALATION_MODEL)
+            else:
+                record_haiku_success(source_url, source_scores)
 
         all_events.extend(events)
         record_source_outcome(source_url, source_scores, published=0, rejected=0)
         adaptive_delay(len(events))
-
-    # ── 4. Discovery searches (pass 1) ───────────────────────────────────────
-    if len(all_events) < MAX_CANDIDATES:
-        log.info(f"\n🌍 Running discovery searches across priority regions...")
-        for region_batch in REGION_BATCHES:
-
-            if len(all_events) >= MAX_CANDIDATES:
-                log.info(f"  🛑 Candidate limit reached — skipping remaining regions")
-                break
-
-            query = (
-                f"Find upcoming events in {region_batch} related to sustainable food systems, "
-                f"food sovereignty, agroecology, regenerative agriculture, food policy, "
-                f"circular food economy, or sustainable nutrition. "
-                f"Include conferences, workshops, festivals, webinars, summits, and community events. "
-                f"Only include events between {SEARCH_FROM} and {SEARCH_TO}. "
-                f"For each event found, if no direct event_link is available, search for the event "
-                f"by name to find the organiser's own website URL and use that as event_link. "
-                f"Only set event_link to null if no URL can be found after searching."
-            )
-            events = search_and_extract(query, system_prompt_discovery)
-            all_events.extend(events)
-            adaptive_delay(len(events))
 
     log.info(f"\n📦 Pass 1 raw candidates: {len(all_events)}")
 
